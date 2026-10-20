@@ -8723,7 +8723,9 @@ GSTextureCache::Palette::~Palette()
 
 std::pair<u8, u8> GSTextureCache::Palette::GetAlphaMinMax(u8 min_index, u8 max_index) const
 {
-	pxAssert(min_index <= max_index);
+	if (min_index > max_index || min_index >= m_pal || max_index >= m_pal) [[unlikely]]
+		return m_alpha_minmax;
+
 	return GSGetRGBA8AlphaMinMax(m_clut + min_index, max_index - min_index + 1, 1, 0);
 }
 
