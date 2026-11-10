@@ -1152,13 +1152,15 @@ void GSDevice11::EndPresent()
 
 	const UINT sync_interval = static_cast<UINT>(m_vsync_mode == GSVSyncMode::FIFO);
 	const UINT flags = (m_vsync_mode == GSVSyncMode::Disabled && m_using_allow_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
-	m_swap_chain->Present(sync_interval, flags);
+	const HRESULT result = m_swap_chain->Present(sync_interval, flags);
 
 	if (m_gpu_timing_enabled)
 		KickTimestampQuery();
 
 	if (m_gpu_pipeline_statistics_enabled)
 		KickPipelineStatisticsQuery();
+
+	m_last_present_succeeded = (result == S_OK);
 }
 
 bool GSDevice11::CreateTimestampQueries()

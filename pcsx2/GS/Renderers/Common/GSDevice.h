@@ -1488,6 +1488,7 @@ protected:
 	WindowInfo m_window_info;
 	GSVSyncMode m_vsync_mode = GSVSyncMode::Disabled;
 	bool m_allow_present_throttle = false;
+	bool m_last_present_succeeded = false;
 	u64 m_last_frame_displayed_time = 0;
 
 	GSTexture* m_merge = nullptr;
@@ -1615,8 +1616,10 @@ public:
 	/// displayed, but the GPU command queue will still be flushed.
 	virtual PresentResult BeginPresent(bool frame_skip) = 0;
 
-	/// Presents the frame to the display.
+	/// Presents the frame. Implementations record whether the graphics API accepted/scheduled it.
 	virtual void EndPresent() = 0;
+	void ResetLastPresentResult() { m_last_present_succeeded = false; }
+	bool WasLastPresentSuccessful() const { return m_last_present_succeeded; }
 
 	/// Changes vsync mode for this display.
 	virtual void SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle) = 0;

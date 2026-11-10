@@ -1470,6 +1470,7 @@ void GSDeviceMTL::EndPresent()
 	ImGui::Render();
 	RenderImGui(ImGui::GetDrawData());
 	EndRenderPass();
+	const bool present_scheduled = (m_current_drawable != nullptr);
 	if (m_current_drawable)
 	{
 		const bool use_present_drawable = m_use_present_drawable == UsePresentDrawable::Always ||
@@ -1533,6 +1534,7 @@ void GSDeviceMTL::EndPresent()
 			}
 		}
 	}
+	m_last_present_succeeded = present_scheduled;
 }}
 
 void GSDeviceMTL::SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle)

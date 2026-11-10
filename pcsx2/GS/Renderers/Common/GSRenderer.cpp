@@ -26,6 +26,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cmath>
 #include <deque>
 #include <thread>
 #include <mutex>
@@ -41,7 +43,87 @@ static constexpr std::array<PresentShader, 8> s_tv_shader_indices = {
 static std::deque<std::thread> s_screenshot_threads;
 static std::mutex s_screenshot_threads_mutex;
 
+static GSPresentationUpscaleHooks s_presentation_upscale_hooks;
+static std::atomic<u64> s_last_successful_present_id{0};
+
 std::unique_ptr<GSRenderer> g_gs_renderer;
+
+void GSSetPresentationUpscaleHooks(const GSPresentationUpscaleHooks& hooks)
+{
+	s_presentation_upscale_hooks = hooks;
+}
+
+u64 GSGetLastSuccessfulPresentId()
+{
+	return s_last_successful_present_id.load(std::memory_order_relaxed);
+}
+
+static bool IsValidPresentationRect(const GSVector4i& rect, const GSTexture* texture)
+{
+	return rect.x >= 0 && rect.y >= 0 && rect.z > rect.x && rect.w > rect.y &&
+		rect.z <= texture->GetWidth() && rect.w <= texture->GetHeight();
+}
+
+GSPresentationUpscaleStatus GSApplyPresentationUpscaleHook(
+	const GSPresentationUpscaleHooks& hooks, GSPresentationUpscaleFrame& frame)
+{
+	const GSVector4& dst = frame.destination_rect;
+	if (!hooks.upscale || !frame.texture || !IsValidPresentationRect(frame.source_rect, frame.texture) ||
+		!std::isfinite(dst.x) || !std::isfinite(dst.y) || !std::isfinite(dst.z) || !std::isfinite(dst.w) ||
+		dst.z <= dst.x || dst.w <= dst.y)
+	{
+		return GSPresentationUpscaleStatus::NotCalled;
+	}
+
+	GSPresentationUpscaleOutput output;
+	if (!hooks.upscale(hooks.userdata, frame, output) || !output.texture || output.texture == frame.texture ||
+		output.texture->IsDepthLike() || !IsValidPresentationRect(output.source_rect, output.texture))
+	{
+		return GSPresentationUpscaleStatus::Failed;
+	}
+
+	frame.texture = output.texture;
+	frame.source_rect = output.source_rect;
+	frame.source_uv = GSVector4(output.source_rect) / GSVector4(output.texture->GetSize()).xyxy();
+	return GSPresentationUpscaleStatus::Applied;
+}
+
+struct PresentationUpscaleAttempt
+{
+	GSPresentationUpscaleHooks hooks;
+	GSPresentationUpscaleStatus status = GSPresentationUpscaleStatus::NotCalled;
+	u64 presentation_id = 0;
+};
+
+static PresentationUpscaleAttempt TryPresentationUpscale(
+	GSTexture*& texture, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool is_redraw)
+{
+	PresentationUpscaleAttempt attempt;
+	if (!s_presentation_upscale_hooks.upscale || !g_gs_device->HasSurface())
+		return attempt;
+
+	attempt.hooks = s_presentation_upscale_hooks;
+	attempt.presentation_id = GSGetLastSuccessfulPresentId() + 1;
+	GSPresentationUpscaleFrame frame = {
+		g_gs_device.get(), texture, src_rect, src_uv, draw_rect, attempt.presentation_id, is_redraw};
+	attempt.status = GSApplyPresentationUpscaleHook(attempt.hooks, frame);
+	if (attempt.status == GSPresentationUpscaleStatus::Applied)
+	{
+		texture = frame.texture;
+		src_rect = frame.source_rect;
+		src_uv = frame.source_uv;
+	}
+	return attempt;
+}
+
+static void CompletePresentationUpscale(const PresentationUpscaleAttempt& attempt, bool succeeded)
+{
+	if (attempt.status != GSPresentationUpscaleStatus::NotCalled && attempt.hooks.presented)
+	{
+		attempt.hooks.presented(attempt.hooks.userdata, attempt.presentation_id, succeeded,
+			attempt.status == GSPresentationUpscaleStatus::Applied);
+	}
+}
 
 // Since we read this on the EE thread, we can't put it in the renderer, because
 // we might be switching while the other thread reads it.
@@ -567,15 +649,20 @@ bool GSRenderer::BeginPresentFrame(bool frame_skip)
 	return false;
 }
 
-void GSRenderer::EndPresentFrame()
+bool GSRenderer::EndPresentFrame()
 {
 	if (GSDumpReplayer::IsReplayingDump())
 		GSDumpReplayer::RenderUI();
 
 	FullscreenUI::Render();
 	ImGuiManager::RenderOSD();
+	g_gs_device->ResetLastPresentResult();
 	g_gs_device->EndPresent();
+	const bool succeeded = g_gs_device->WasLastPresentSuccessful();
+	if (succeeded)
+		s_last_successful_present_id.fetch_add(1, std::memory_order_relaxed);
 	ImGuiManager::NewFrame();
+	return succeeded;
 }
 
 void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
@@ -658,6 +745,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		GSVector4i src_rect;
 		GSVector4 src_uv, draw_rect;
 		GSTexture* current = g_gs_device->GetCurrent();
+		PresentationUpscaleAttempt upscale_attempt;
 		if (current && !blank_frame)
 		{
 			src_rect = CalculateDrawSrcRect(current, m_real_size);
@@ -667,13 +755,16 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				GetVideoMode() == GSVideoMode::SDTV_480P);
 			s_last_draw_rect = draw_rect;
 
+			upscale_attempt = TryPresentationUpscale(current, src_rect, src_uv, draw_rect, false);
+
 			if (GSConfig.CASMode != GSCASMode::Disabled)
 			{
 				static bool cas_log_once = false;
 				if (g_gs_device->Features().cas_sharpening)
 				{
 					// sharpen only if the IR is higher than the display resolution
-					const bool sharpen_only = (GSConfig.CASMode == GSCASMode::SharpenOnly ||
+					const bool sharpen_only = (upscale_attempt.status == GSPresentationUpscaleStatus::Applied ||
+					                           GSConfig.CASMode == GSCASMode::SharpenOnly ||
 					                           (current->GetWidth() > g_gs_device->GetWindowWidth() &&
 					                            current->GetHeight() > g_gs_device->GetWindowHeight()));
 					g_gs_device->CAS(current, src_rect, src_uv, draw_rect, sharpen_only);
@@ -688,6 +779,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			}
 		}
 
+		bool present_succeeded = false;
 		if (BeginPresentFrame(false))
 		{
 			if (current && !blank_frame)
@@ -699,13 +791,14 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 					s_tv_shader_indices[GSConfig.TVShader], shader_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off));
 			}
 
-			EndPresentFrame();
+			present_succeeded = EndPresentFrame();
 
 			const float gpu_time = g_gs_device->GetAndResetAccumulatedGPUTime();
 			GPUPipelineStatistics gpu_stats = g_gs_device->GetAndResetAccumulatedGPUPipelineStatistics();
 			PerformanceMetrics::OnGPUPresent(gpu_time, gpu_stats.vs_invocations, gpu_stats.ps_invocations);
 		}
 
+		CompletePresentationUpscale(upscale_attempt, present_succeeded);
 		PerformanceMetrics::Update(registers_written, fb_sprite_frame, false);
 	}
 
@@ -985,16 +1078,38 @@ bool GSRenderer::IsSavingMetrics()
 
 void GSRenderer::PresentCurrentFrame()
 {
+	PresentationUpscaleAttempt upscale_attempt;
+	GSTexture* current = nullptr;
+	GSVector4 src_uv, draw_rect;
+	if (s_presentation_upscale_hooks.upscale && g_gs_device->HasSurface() &&
+		(current = g_gs_device->GetCurrent()))
+	{
+		GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
+		src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
+		draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
+			src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
+			GetVideoMode() == GSVideoMode::SDTV_480P);
+		upscale_attempt = TryPresentationUpscale(current, src_rect, src_uv, draw_rect, true);
+	}
+
+	bool present_succeeded = false;
 	if (BeginPresentFrame(false))
 	{
-		GSTexture* current = g_gs_device->GetCurrent();
+		if (upscale_attempt.status != GSPresentationUpscaleStatus::Applied)
+		{
+			current = g_gs_device->GetCurrent();
+			if (current)
+			{
+				const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
+				src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
+				draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
+					src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
+					GetVideoMode() == GSVideoMode::SDTV_480P);
+			}
+		}
+
 		if (current)
 		{
-			const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
-			const GSVector4 src_uv(GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy());
-			const GSVector4 draw_rect(CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
-				src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
-				GetVideoMode() == GSVideoMode::SDTV_480P));
 			s_last_draw_rect = draw_rect;
 
 			const u64 current_time = Common::Timer::GetCurrentValue();
@@ -1004,8 +1119,9 @@ void GSRenderer::PresentCurrentFrame()
 				s_tv_shader_indices[GSConfig.TVShader], shader_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off));
 		}
 
-		EndPresentFrame();
+		present_succeeded = EndPresentFrame();
 	}
+	CompletePresentationUpscale(upscale_attempt, present_succeeded);
 }
 
 void GSTranslateWindowToDisplayCoordinates(float window_x, float window_y, float* display_x, float* display_y)

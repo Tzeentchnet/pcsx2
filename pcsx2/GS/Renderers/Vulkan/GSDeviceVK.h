@@ -49,10 +49,64 @@ public:
 		bool vk_ext_fragment_shader_interlock : 1;
 	};
 
+	struct IntegrationHooks
+	{
+		void* userdata = nullptr;
+		void (*instance_extensions)(void* userdata, const std::vector<VkExtensionProperties>& available,
+			std::vector<std::string>& requested) = nullptr;
+		void (*device_extensions)(void* userdata, VkInstance instance, VkPhysicalDevice physical_device,
+			const std::vector<VkExtensionProperties>& available, std::vector<std::string>& requested) = nullptr;
+		void (*device_created)(void* userdata, GSDeviceVK& device,
+			bool instance_extensions_enabled, bool device_extensions_enabled) = nullptr;
+		void (*device_destroying)(void* userdata, GSDeviceVK& device) = nullptr;
+	};
+
+	// Set before device creation, and clear only after its destruction. Hooks are snapshotted
+	// for each device and must not re-enter registration or Vulkan device creation. Extension
+	// callbacks supply names (including dependencies) from the enumerated available list.
+	// Requests are all-or-nothing and optional for PCSX2: unsupported names or a failed
+	// Vulkan create fall back to the original extension list. device_created reports whether
+	// each request was enabled; device_destroying runs after pending GPU work is flushed and
+	// before PCSX2 tears down the device. Callbacks and userdata must outlive the device.
+	static void SetIntegrationHooks(const IntegrationHooks& hooks);
+
+	struct ExternalImage
+	{
+		VkImage image;
+		VkImageView view;
+		VkFormat format;
+		VkExtent2D extent;
+		VkImageLayout layout;
+	};
+
+	struct ExternalCommands
+	{
+		VkCommandBuffer command_buffer;
+		ExternalImage source;
+		ExternalImage output;
+		u64 fence_counter;
+	};
+
+	using ExternalCommandsCallback = bool (*)(void* userdata, const ExternalCommands& commands);
+
+	// Record external work outside a render pass on the current graphics command buffer.
+	// The distinct, single-level color images are supplied in GENERAL layout; output must be
+	// a shader-write texture created by this device. Source is read-only. Before returning,
+	// the callback must end its render pass, restore both images to GENERAL, and synchronize
+	// any internal layout/queue changes. It must not submit, end or retain the command buffer,
+	// or alter other PCSX2-tracked resources. The bridge barriers both images for external work
+	// and subsequent sampling, invalidates the PCSX2 binding cache, and rebinds its vertex
+	// buffer even on failure. Subsequent PCSX2 draws must re-establish their resource bindings;
+	// a pre-existing PCSX2 render pass cannot be resumed.
+	// Keep all external resources alive until fence_counter has completed.
+	bool ExecuteExternalCommands(GSTexture* source, GSTexture* output,
+		ExternalCommandsCallback callback, void* userdata);
+
 	// Global state accessors
 	__fi VkInstance GetVulkanInstance() const { return m_instance; }
 	__fi VkPhysicalDevice GetPhysicalDevice() const { return m_physical_device; }
 	__fi VkDevice GetDevice() const { return m_device; }
+	__fi VkQueue GetGraphicsQueue() const { return m_graphics_queue; }
 	__fi VmaAllocator GetAllocator() const { return m_allocator; }
 	__fi u32 GetGraphicsQueueFamilyIndex() const { return m_graphics_queue_family_index; }
 	__fi u32 GetPresentQueueFamilyIndex() const { return m_present_queue_family_index; }
@@ -136,13 +190,13 @@ public:
 private:
 	// Helper method to create a Vulkan instance.
 	static VkInstance CreateVulkanInstance(const WindowInfo& wi, OptionalExtensions* oe, bool enable_debug_utils,
-		bool enable_validation_layer);
+		bool enable_validation_layer, const IntegrationHooks* hooks = nullptr, bool* extensions_enabled = nullptr);
 
 	// Enable/disable debug message runtime.
 	bool EnableDebugUtils();
 	void DisableDebugUtils();
 
-	void SubmitCommandBuffer(VKSwapChain* present_swap_chain);
+	bool SubmitCommandBuffer(VKSwapChain* present_swap_chain);
 	void MoveToNextCommandBuffer();
 
 	enum class WaitType
@@ -183,8 +237,10 @@ private:
 
 	using ExtensionList = std::vector<const char*>;
 	static bool SelectInstanceExtensions(ExtensionList* extension_list, const WindowInfo& wi, OptionalExtensions* oe,
-		bool enable_debug_utils);
-	bool SelectDeviceExtensions(ExtensionList* extension_list, bool enable_surface);
+		bool enable_debug_utils, const IntegrationHooks* hooks, std::vector<std::string>* requested_extensions,
+		size_t* base_extension_count, bool* extensions_enabled);
+	bool SelectDeviceExtensions(ExtensionList* extension_list, bool enable_surface,
+		std::vector<std::string>* requested_extensions, size_t* base_extension_count, bool* extensions_enabled);
 	bool SelectDeviceFeatures();
 	bool CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer);
 	bool ProcessDeviceExtensions();
@@ -246,6 +302,10 @@ private:
 	VkPhysicalDevice m_physical_device = VK_NULL_HANDLE;
 	VkDevice m_device = VK_NULL_HANDLE;
 	VmaAllocator m_allocator = VK_NULL_HANDLE;
+	IntegrationHooks m_integration_hooks;
+	bool m_integration_active = false;
+	bool m_integration_instance_extensions_enabled = true;
+	bool m_integration_device_extensions_enabled = true;
 
 	VkCommandBuffer m_current_command_buffer = VK_NULL_HANDLE;
 

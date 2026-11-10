@@ -1291,13 +1291,15 @@ void GSDeviceOGL::EndPresent()
 	if (m_gpu_timing_enabled)
 		PopTimestampQuery();
 
-	m_gl_context->SwapBuffers();
+	const bool succeeded = m_gl_context->SwapBuffers();
 
 	if (m_gpu_timing_enabled)
 		KickTimestampQuery();
 
 	if (m_gpu_pipeline_statistics_enabled)
 		KickPipelineStatisticsQuery();
+
+	m_last_present_succeeded = succeeded;
 }
 
 void GSDeviceOGL::CreateTimestampQueries()

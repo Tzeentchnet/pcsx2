@@ -24,7 +24,9 @@
 
 #include "imgui.h"
 
+#include <algorithm>
 #include <bit>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -77,11 +79,44 @@ static constexpr VkClearValue s_present_clear_color = {{{0.0f, 0.0f, 0.0f, 1.0f}
 
 // We need to synchronize instance creation because of adapter enumeration from the UI thread.
 static std::mutex s_instance_mutex;
+static GSDeviceVK::IntegrationHooks s_integration_hooks;
 
 // Device extensions that are required for PCSX2.
 static constexpr const char* s_required_device_extensions[] = {
 	VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 };
+
+void GSDeviceVK::SetIntegrationHooks(const IntegrationHooks& hooks)
+{
+	std::lock_guard lock(s_instance_mutex);
+	s_integration_hooks = hooks;
+}
+
+static bool AppendIntegrationExtensions(const std::vector<VkExtensionProperties>& available,
+	const std::vector<std::string>& requested, std::vector<const char*>* enabled)
+{
+	for (const std::string& name : requested)
+	{
+		if (name.empty() || name.find('\0') != std::string::npos ||
+			std::none_of(available.begin(), available.end(),
+				[&name](const VkExtensionProperties& properties) { return name == properties.extensionName; }))
+		{
+			Console.Warning("VK: External extension '%s' is unavailable; disabling integration extensions.", name.c_str());
+			return false;
+		}
+	}
+
+	for (const std::string& name : requested)
+	{
+		if (std::none_of(enabled->begin(), enabled->end(),
+				[&name](const char* existing) { return std::strcmp(existing, name.c_str()) == 0; }))
+		{
+			DevCon.WriteLn("VK: Enabling external extension: %s", name.c_str());
+			enabled->push_back(name.c_str());
+		}
+	}
+	return true;
+}
 
 GSDeviceVK::GSDeviceVK()
 {
@@ -95,10 +130,16 @@ GSDeviceVK::GSDeviceVK()
 GSDeviceVK::~GSDeviceVK() = default;
 
 VkInstance GSDeviceVK::CreateVulkanInstance(const WindowInfo& wi, OptionalExtensions* oe, bool enable_debug_utils,
-	bool enable_validation_layer)
+	bool enable_validation_layer, const IntegrationHooks* hooks, bool* extensions_enabled)
 {
 	ExtensionList enabled_extensions;
-	if (!SelectInstanceExtensions(&enabled_extensions, wi, oe, enable_debug_utils))
+	std::vector<std::string> requested_extensions;
+	size_t base_extension_count = 0;
+	bool requested_extensions_enabled = true;
+	if (extensions_enabled)
+		*extensions_enabled = false;
+	if (!SelectInstanceExtensions(&enabled_extensions, wi, oe, enable_debug_utils, hooks,
+			&requested_extensions, &base_extension_count, &requested_extensions_enabled))
 		return VK_NULL_HANDLE;
 
 	VkApplicationInfo app_info = {};
@@ -132,17 +173,27 @@ VkInstance GSDeviceVK::CreateVulkanInstance(const WindowInfo& wi, OptionalExtens
 
 	VkInstance instance;
 	VkResult res = vkCreateInstance(&instance_create_info, nullptr, &instance);
+	if (res != VK_SUCCESS && enabled_extensions.size() > base_extension_count)
+	{
+		Console.Warning("VK: Instance creation with external extensions failed; retrying without them.");
+		instance_create_info.enabledExtensionCount = static_cast<u32>(base_extension_count);
+		requested_extensions_enabled = false;
+		res = vkCreateInstance(&instance_create_info, nullptr, &instance);
+	}
 	if (res != VK_SUCCESS)
 	{
 		LOG_VULKAN_ERROR(res, "vkCreateInstance failed: ");
 		return nullptr;
 	}
 
+	if (extensions_enabled)
+		*extensions_enabled = requested_extensions_enabled;
 	return instance;
 }
 
 bool GSDeviceVK::SelectInstanceExtensions(ExtensionList* extension_list, const WindowInfo& wi, OptionalExtensions* oe,
-	bool enable_debug_utils)
+	bool enable_debug_utils, const IntegrationHooks* hooks, std::vector<std::string>* requested_extensions,
+	size_t* base_extension_count, bool* extensions_enabled)
 {
 	u32 extension_count = 0;
 	VkResult res = vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr);
@@ -218,6 +269,13 @@ bool GSDeviceVK::SelectInstanceExtensions(ExtensionList* extension_list, const W
 
 	// Needed for exclusive fullscreen control.
 	SupportsExtension(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, false);
+
+	*base_extension_count = extension_list->size();
+	if (hooks && hooks->instance_extensions)
+	{
+		hooks->instance_extensions(hooks->userdata, available_extension_list, *requested_extensions);
+		*extensions_enabled = AppendIntegrationExtensions(available_extension_list, *requested_extensions, extension_list);
+	}
 
 	return true;
 }
@@ -355,7 +413,8 @@ GSDeviceVK::GPUList GSDeviceVK::EnumerateGPUs()
 	return gpus;
 }
 
-bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enable_surface)
+bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enable_surface,
+	std::vector<std::string>* requested_extensions, size_t* base_extension_count, bool* extensions_enabled)
 {
 	u32 extension_count = 0;
 	VkResult res = vkEnumerateDeviceExtensionProperties(m_physical_device, nullptr, &extension_count, nullptr);
@@ -445,6 +504,14 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 #endif
 
 	m_optional_extensions.vk_ext_fragment_shader_interlock = SupportsExtension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, false);
+
+	*base_extension_count = extension_list->size();
+	if (m_integration_hooks.device_extensions)
+	{
+		m_integration_hooks.device_extensions(m_integration_hooks.userdata, m_instance, m_physical_device,
+			available_extension_list, *requested_extensions);
+		*extensions_enabled = AppendIntegrationExtensions(available_extension_list, *requested_extensions, extension_list);
+	}
 
 	return true;
 }
@@ -600,7 +667,11 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	device_info.pQueueCreateInfos = queue_infos.data();
 
 	ExtensionList enabled_extensions;
-	if (!SelectDeviceExtensions(&enabled_extensions, surface != VK_NULL_HANDLE))
+	std::vector<std::string> requested_extensions;
+	size_t base_extension_count = 0;
+	bool requested_extensions_enabled = true;
+	if (!SelectDeviceExtensions(&enabled_extensions, surface != VK_NULL_HANDLE,
+			&requested_extensions, &base_extension_count, &requested_extensions_enabled))
 		return false;
 
 	device_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
@@ -667,11 +738,19 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	}
 
 	VkResult res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
+	if (res != VK_SUCCESS && enabled_extensions.size() > base_extension_count)
+	{
+		Console.Warning("VK: Device creation with external extensions failed; retrying without them.");
+		device_info.enabledExtensionCount = static_cast<u32>(base_extension_count);
+		requested_extensions_enabled = false;
+		res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
+	}
 	if (res != VK_SUCCESS)
 	{
 		LOG_VULKAN_ERROR(res, "vkCreateDevice failed: ");
 		return false;
 	}
+	m_integration_device_extensions_enabled = requested_extensions_enabled;
 
 	// With the device created, we can fill the remaining entry points.
 	if (!Vulkan::LoadVulkanDeviceFunctions(m_device))
@@ -1277,7 +1356,7 @@ void GSDeviceVK::WaitForCommandBufferCompletion(u32 index)
 	m_completed_fence_counter = now_completed_counter;
 }
 
-void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
+bool GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 {
 	FrameResources& resources = m_frame_resources[m_current_frame];
 
@@ -1387,7 +1466,7 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 	{
 		LOG_VULKAN_ERROR(res, "vkQueueSubmit failed: ");
 		m_last_submit_failed = true;
-		return;
+		return false;
 	}
 
 	if (spin_cycles != 0)
@@ -1411,7 +1490,7 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 			else
 				LOG_VULKAN_ERROR(res, "vkQueuePresentKHR failed: ");
 
-			return;
+			return false;
 		}
 
 		// Grab the next image as soon as possible, that way we spend less time blocked on the next
@@ -1419,6 +1498,8 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 		// Credit to dxvk for the idea.
 		present_swap_chain->AcquireNextImage();
 	}
+
+	return true;
 }
 
 void GSDeviceVK::CommandBufferCompleted(u32 index)
@@ -2261,12 +2342,30 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		return false;
 
 	InitializeState();
+	m_integration_active = true;
+	if (m_integration_hooks.device_created)
+	{
+		m_integration_hooks.device_created(m_integration_hooks.userdata, *this,
+			m_integration_instance_extensions_enabled, m_integration_device_extensions_enabled);
+	}
 	return true;
 }
 
 void GSDeviceVK::Destroy()
 {
 	std::unique_lock lock(s_instance_mutex);
+
+	if (m_integration_active && m_integration_hooks.device_destroying)
+	{
+		EndRenderPass();
+		if (GetCurrentCommandBuffer() != VK_NULL_HANDLE)
+		{
+			ExecuteCommandBuffer(false);
+			WaitForGPUIdle();
+		}
+		m_integration_hooks.device_destroying(m_integration_hooks.userdata, *this);
+	}
+	m_integration_active = false;
 
 	GSDevice::Destroy();
 
@@ -2548,10 +2647,48 @@ void GSDeviceVK::EndPresent()
 	m_swap_chain->GetCurrentTexture()->TransitionToLayout(cmdbuffer, GSTextureVK::Layout::PresentSrc);
 	g_perfmon.Put(GSPerfMon::RenderPasses, 1);
 
-	SubmitCommandBuffer(m_swap_chain.get());
+	m_last_present_succeeded = SubmitCommandBuffer(m_swap_chain.get());
 	MoveToNextCommandBuffer();
 
 	InvalidateCachedState();
+}
+
+bool GSDeviceVK::ExecuteExternalCommands(GSTexture* source, GSTexture* output,
+	ExternalCommandsCallback callback, void* userdata)
+{
+	if (!source || !output || source == output || !callback || m_is_presenting || m_last_submit_failed ||
+		m_current_command_buffer == VK_NULL_HANDLE || source->IsDepthLike() || output->IsDepthLike() ||
+		!output->IsShaderWrite() || source->GetMipmapLevels() != 1 || output->GetMipmapLevels() != 1 ||
+		source->GetState() == GSTexture::State::Invalidated)
+	{
+		return false;
+	}
+
+	GSTextureVK* const src = static_cast<GSTextureVK*>(source);
+	GSTextureVK* const dst = static_cast<GSTextureVK*>(output);
+	EndRenderPass();
+	src->CommitClear();
+
+	const VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
+	const u64 fence_counter = GetCurrentFenceCounter();
+	src->SetUseFenceCounter(fence_counter);
+	dst->SetUseFenceCounter(fence_counter);
+	src->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ExternalReadWrite);
+	dst->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ExternalReadWrite);
+	dst->SetState(GSTexture::State::Dirty);
+
+	const auto get_image = [](const GSTextureVK* texture) {
+		return ExternalImage{texture->GetImage(), texture->GetView(), texture->GetVkFormat(),
+			{static_cast<u32>(texture->GetWidth()), static_cast<u32>(texture->GetHeight())}, texture->GetVkLayout()};
+	};
+	const ExternalCommands commands = {cmdbuf, get_image(src), get_image(dst), fence_counter};
+	const bool succeeded = callback(userdata, commands);
+
+	src->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ShaderReadOnly);
+	dst->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ShaderReadOnly);
+	InvalidateCachedState();
+	SetInitialState(cmdbuf);
+	return succeeded;
 }
 
 bool GSDeviceVK::IsPresenting() const
@@ -2639,6 +2776,7 @@ void GSDeviceVK::InsertDebugMessage(DebugMessageCategory category, const char* f
 bool GSDeviceVK::CreateDeviceAndSwapChain()
 {
 	std::unique_lock lock(s_instance_mutex);
+	m_integration_hooks = s_integration_hooks;
 	bool enable_debug_utils = GSConfig.UseDebugDevice;
 	bool enable_validation_layer = GSConfig.UseDebugDevice;
 
@@ -2653,7 +2791,8 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
 	if (!AcquireWindow(true))
 		return false;
 
-	m_instance = CreateVulkanInstance(m_window_info, &m_optional_extensions, enable_debug_utils, enable_validation_layer);
+	m_instance = CreateVulkanInstance(m_window_info, &m_optional_extensions, enable_debug_utils, enable_validation_layer,
+		&m_integration_hooks, &m_integration_instance_extensions_enabled);
 	if (m_instance == VK_NULL_HANDLE)
 	{
 		if (enable_debug_utils || enable_validation_layer)
@@ -2661,7 +2800,8 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
 			// Try again without the validation layer.
 			enable_debug_utils = false;
 			enable_validation_layer = false;
-			m_instance = CreateVulkanInstance(m_window_info, &m_optional_extensions, enable_debug_utils, enable_validation_layer);
+			m_instance = CreateVulkanInstance(m_window_info, &m_optional_extensions, enable_debug_utils, enable_validation_layer,
+				&m_integration_hooks, &m_integration_instance_extensions_enabled);
 			if (m_instance == VK_NULL_HANDLE)
 			{
 				Host::ReportErrorAsync("Error", "Failed to create Vulkan instance. Does your GPU and/or driver support Vulkan?");

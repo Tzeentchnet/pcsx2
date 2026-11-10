@@ -27,6 +27,7 @@ public:
 		FeedbackLoop,
 		ReadWriteImage,
 		ComputeReadWriteImage,
+		ExternalReadWrite,
 		General,
 		Count
 	};

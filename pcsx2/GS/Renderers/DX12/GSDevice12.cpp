@@ -1454,9 +1454,10 @@ void GSDevice12::EndPresent()
 
 	const UINT sync_interval = static_cast<UINT>(m_vsync_mode == GSVSyncMode::FIFO);
 	const UINT flags = (m_vsync_mode == GSVSyncMode::Disabled && m_using_allow_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
-	m_swap_chain->Present(sync_interval, flags);
+	const HRESULT result = m_swap_chain->Present(sync_interval, flags);
 
 	InvalidateCachedState();
+	m_last_present_succeeded = (result == S_OK);
 }
 
 #ifdef ENABLE_OGL_DEBUG
