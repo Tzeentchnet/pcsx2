@@ -22,6 +22,40 @@ namespace Vulkan
 	// Adds a structure to a chain.
 	void AddPointerToChain(void* head, const void* ptr);
 
+	class ScopedPNextLink final
+	{
+	public:
+		ScopedPNextLink() = default;
+		~ScopedPNextLink() { Reset(); }
+		ScopedPNextLink(const ScopedPNextLink&) = delete;
+		ScopedPNextLink& operator=(const ScopedPNextLink&) = delete;
+
+		void Append(VkBaseOutStructure* tail, const void* next)
+		{
+			Reset();
+			if (tail)
+			{
+				m_tail = tail;
+				m_original = tail->pNext;
+				tail->pNext = const_cast<VkBaseOutStructure*>(static_cast<const VkBaseOutStructure*>(next));
+			}
+		}
+
+		void Reset()
+		{
+			if (m_tail)
+			{
+				m_tail->pNext = m_original;
+				m_tail = nullptr;
+				m_original = nullptr;
+			}
+		}
+
+	private:
+		VkBaseOutStructure* m_tail = nullptr;
+		VkBaseOutStructure* m_original = nullptr;
+	};
+
 	const char* VkResultToString(VkResult res);
 	void LogVulkanResult(const char* func_name, VkResult res, const char* msg, ...);
 

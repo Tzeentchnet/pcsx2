@@ -3,6 +3,7 @@ add_pcsx2_test(core_test
 	MockMemoryInterface.h
 	StubHost.cpp
 	GS/presentation_hook_tests.cpp
+	GS/vulkan_feature_chain_tests.cpp
 )
 
 set(multi_isa_sources

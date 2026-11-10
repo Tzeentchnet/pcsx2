@@ -75,7 +75,9 @@ public:
 	// Requests are all-or-nothing and optional for PCSX2: unsupported names/features or a
 	// failed Vulkan create fall back to the original device configuration. device_features
 	// supplies already-queried extension feature structs, owned until device_created; their
-	// sTypes must not overlap PCSX2's feature chain. Core features are validated by PCSX2.
+	// sTypes must not overlap PCSX2's feature chain. PCSX2 restores the caller's pNext links
+	// immediately after vkCreateDevice, including before any fallback or completion callback.
+	// Core features are validated by PCSX2.
 	// device_created reports negotiation results. device_destroying runs before device
 	// destruction, after submitting pending work and waiting for idle. VK_SUCCESS proves GPU
 	// completion; VK_ERROR_DEVICE_LOST reports terminal device loss, not successful completion.

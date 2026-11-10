@@ -741,6 +741,7 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	const void* const base_feature_chain = device_info.pNext;
 	bool requested_features_enabled = true;
 	bool integration_features_applied = false;
+	Vulkan::ScopedPNextLink integration_feature_link;
 	if (m_integration_hooks.device_features)
 	{
 		IntegrationDeviceFeatures requested;
@@ -784,8 +785,7 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			std::memcpy(&m_device_features, enabled_bits.data(), sizeof(m_device_features));
 			if (last)
 			{
-				last->pNext = const_cast<VkBaseOutStructure*>(
-					static_cast<const VkBaseOutStructure*>(base_feature_chain));
+				integration_feature_link.Append(last, base_feature_chain);
 				device_info.pNext = requested.extension_chain;
 			}
 			integration_features_applied = true;
@@ -800,6 +800,7 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	}
 
 	VkResult res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
+	integration_feature_link.Reset();
 	if (res != VK_SUCCESS && (enabled_extensions.size() > base_extension_count || integration_features_applied))
 	{
 		Console.Warning("VK: Device creation with external requirements failed; retrying without them.");
