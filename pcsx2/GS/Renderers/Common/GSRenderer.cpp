@@ -125,6 +125,17 @@ static void CompletePresentationUpscale(const PresentationUpscaleAttempt& attemp
 	}
 }
 
+static void NotifyPresentedUpscaleFrame(const PresentationUpscaleAttempt& attempt, bool succeeded,
+	GSTexture* texture, const GSVector4i& src_rect, const GSVector4& src_uv, const GSVector4& draw_rect, bool is_redraw)
+{
+	if (succeeded && attempt.status == GSPresentationUpscaleStatus::Applied && attempt.hooks.presented_frame)
+	{
+		const GSPresentationUpscaleFrame frame = {
+			g_gs_device.get(), texture, src_rect, src_uv, draw_rect, attempt.presentation_id, is_redraw};
+		attempt.hooks.presented_frame(attempt.hooks.userdata, frame);
+	}
+}
+
 // Since we read this on the EE thread, we can't put it in the renderer, because
 // we might be switching while the other thread reads it.
 static GSVector4 s_last_draw_rect;
@@ -798,6 +809,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			PerformanceMetrics::OnGPUPresent(gpu_time, gpu_stats.vs_invocations, gpu_stats.ps_invocations);
 		}
 
+		NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, current, src_rect, src_uv, draw_rect, false);
 		CompletePresentationUpscale(upscale_attempt, present_succeeded);
 		PerformanceMetrics::Update(registers_written, fb_sprite_frame, false);
 	}
@@ -1080,11 +1092,12 @@ void GSRenderer::PresentCurrentFrame()
 {
 	PresentationUpscaleAttempt upscale_attempt;
 	GSTexture* current = nullptr;
+	GSVector4i src_rect;
 	GSVector4 src_uv, draw_rect;
 	if (s_presentation_upscale_hooks.upscale && g_gs_device->HasSurface() &&
 		(current = g_gs_device->GetCurrent()))
 	{
-		GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
+		src_rect = CalculateDrawSrcRect(current, m_real_size);
 		src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
 		draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
 			src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
@@ -1100,7 +1113,7 @@ void GSRenderer::PresentCurrentFrame()
 			current = g_gs_device->GetCurrent();
 			if (current)
 			{
-				const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
+				src_rect = CalculateDrawSrcRect(current, m_real_size);
 				src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
 				draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
 					src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
@@ -1121,6 +1134,7 @@ void GSRenderer::PresentCurrentFrame()
 
 		present_succeeded = EndPresentFrame();
 	}
+	NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, current, src_rect, src_uv, draw_rect, true);
 	CompletePresentationUpscale(upscale_attempt, present_succeeded);
 }
 

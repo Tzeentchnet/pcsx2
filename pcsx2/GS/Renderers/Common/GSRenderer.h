@@ -30,6 +30,7 @@ struct GSPresentationUpscaleHooks
 	bool (*upscale)(void* userdata, const GSPresentationUpscaleFrame& frame,
 		GSPresentationUpscaleOutput& output) = nullptr;
 	void (*presented)(void* userdata, u64 presentation_id, bool succeeded, bool used_upscaled_output) = nullptr;
+	void (*presented_frame)(void* userdata, const GSPresentationUpscaleFrame& frame) = nullptr;
 };
 
 enum class GSPresentationUpscaleStatus
@@ -51,7 +52,10 @@ enum class GSPresentationUpscaleStatus
 // presents. A failed present does not consume presentation_id; consumers must discard or
 // reset speculative temporal history. Device destruction can occur before a pending
 // completion callback; it must not use destroyed device resources. Redraws are explicitly
-// identified in the frame.
+// identified in the frame. After a successful upscaled present, presented_frame receives
+// the actual post-processing input used for presentation, including its source and
+// destination rectangles. It is borrowed only until the next GS render, reset,
+// configuration change, resize, or device destruction; copy it before then if needed.
 void GSSetPresentationUpscaleHooks(const GSPresentationUpscaleHooks& hooks);
 
 // Process-wide, monotonically increasing identity of the last renderer-driven present
