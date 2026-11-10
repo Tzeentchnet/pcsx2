@@ -16,6 +16,7 @@ struct GSPresentationUpscaleFrame
 	GSVector4 destination_rect; // Window coordinates, using the device's origin.
 	u64 presentation_id;        // Next successful-present ID; reused after failure.
 	bool is_redraw;             // Re-presenting the current frame.
+	bool source_may_repeat;     // No draws/transfers since the previous VSync, or an explicit redraw.
 };
 
 struct GSPresentationUpscaleOutput

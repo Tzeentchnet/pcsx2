@@ -96,7 +96,8 @@ struct PresentationUpscaleAttempt
 };
 
 static PresentationUpscaleAttempt TryPresentationUpscale(
-	GSTexture*& texture, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool is_redraw)
+	GSTexture*& texture, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect,
+	bool is_redraw, bool source_may_repeat)
 {
 	PresentationUpscaleAttempt attempt;
 	if (!s_presentation_upscale_hooks.upscale || !g_gs_device->HasSurface())
@@ -105,7 +106,7 @@ static PresentationUpscaleAttempt TryPresentationUpscale(
 	attempt.hooks = s_presentation_upscale_hooks;
 	attempt.presentation_id = GSGetLastSuccessfulPresentId() + 1;
 	GSPresentationUpscaleFrame frame = {
-		g_gs_device.get(), texture, src_rect, src_uv, draw_rect, attempt.presentation_id, is_redraw};
+		g_gs_device.get(), texture, src_rect, src_uv, draw_rect, attempt.presentation_id, is_redraw, source_may_repeat};
 	attempt.status = GSApplyPresentationUpscaleHook(attempt.hooks, frame);
 	if (attempt.status == GSPresentationUpscaleStatus::Applied)
 	{
@@ -126,12 +127,13 @@ static void CompletePresentationUpscale(const PresentationUpscaleAttempt& attemp
 }
 
 static void NotifyPresentedUpscaleFrame(const PresentationUpscaleAttempt& attempt, bool succeeded,
-	GSTexture* texture, const GSVector4i& src_rect, const GSVector4& src_uv, const GSVector4& draw_rect, bool is_redraw)
+	GSTexture* texture, const GSVector4i& src_rect, const GSVector4& src_uv, const GSVector4& draw_rect,
+	bool is_redraw, bool source_may_repeat)
 {
 	if (succeeded && attempt.status == GSPresentationUpscaleStatus::Applied && attempt.hooks.presented_frame)
 	{
 		const GSPresentationUpscaleFrame frame = {
-			g_gs_device.get(), texture, src_rect, src_uv, draw_rect, attempt.presentation_id, is_redraw};
+			g_gs_device.get(), texture, src_rect, src_uv, draw_rect, attempt.presentation_id, is_redraw, source_may_repeat};
 		attempt.hooks.presented_frame(attempt.hooks.userdata, frame);
 	}
 }
@@ -766,7 +768,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				GetVideoMode() == GSVideoMode::SDTV_480P);
 			s_last_draw_rect = draw_rect;
 
-			upscale_attempt = TryPresentationUpscale(current, src_rect, src_uv, draw_rect, false);
+			upscale_attempt = TryPresentationUpscale(current, src_rect, src_uv, draw_rect, false, idle_frame);
 
 			if (GSConfig.CASMode != GSCASMode::Disabled)
 			{
@@ -809,7 +811,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			PerformanceMetrics::OnGPUPresent(gpu_time, gpu_stats.vs_invocations, gpu_stats.ps_invocations);
 		}
 
-		NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, current, src_rect, src_uv, draw_rect, false);
+		NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, current, src_rect, src_uv, draw_rect, false, idle_frame);
 		CompletePresentationUpscale(upscale_attempt, present_succeeded);
 		PerformanceMetrics::Update(registers_written, fb_sprite_frame, false);
 	}
@@ -1102,7 +1104,7 @@ void GSRenderer::PresentCurrentFrame()
 		draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
 			src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
 			GetVideoMode() == GSVideoMode::SDTV_480P);
-		upscale_attempt = TryPresentationUpscale(current, src_rect, src_uv, draw_rect, true);
+		upscale_attempt = TryPresentationUpscale(current, src_rect, src_uv, draw_rect, true, true);
 	}
 
 	bool present_succeeded = false;
@@ -1134,7 +1136,7 @@ void GSRenderer::PresentCurrentFrame()
 
 		present_succeeded = EndPresentFrame();
 	}
-	NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, current, src_rect, src_uv, draw_rect, true);
+	NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, current, src_rect, src_uv, draw_rect, true, true);
 	CompletePresentationUpscale(upscale_attempt, present_succeeded);
 }
 
