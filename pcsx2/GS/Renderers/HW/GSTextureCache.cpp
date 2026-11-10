@@ -17,6 +17,7 @@
 
 #include "fmt/format.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <math.h>
 
@@ -7869,8 +7870,11 @@ bool GSTextureCache::Source::ClutMatch(const PaletteKey& palette_key)
 
 // GSTextureCache::Target
 
+static std::atomic<u64> s_target_observation_id{0};
+
 GSTextureCache::Target::Target(GIFRegTEX0 TEX0, int type, const GSVector2i& unscaled_size, float scale, GSTexture* texture)
 	: m_type(type)
+	, m_observation_id(s_target_observation_id.fetch_add(1, std::memory_order_relaxed) + 1)
 	, m_used(type == RenderTarget) // FIXME
 	, m_valid(GSVector4i::zero())
 {

@@ -86,6 +86,7 @@ protected:
 	Usage m_usage = Usage::Texture;
 	Format m_format = Format::Invalid;
 	State m_state = State::Dirty;
+	const u64 m_observation_id;
 
 	// frame number (arbitrary base) the texture was recycled on
 	// different purpose than texture cache ages, do not attempt to merge
@@ -118,6 +119,7 @@ public:
 
 	__fi int GetWidth() const { return m_size.x; }
 	__fi int GetHeight() const { return m_size.y; }
+	__fi u64 GetObservationId() const { return m_observation_id; }
 	__fi const GSVector2i& GetSize() const { return m_size; }
 	__fi GSVector4i GetRect() const { return GSVector4i::loadh(m_size); }
 

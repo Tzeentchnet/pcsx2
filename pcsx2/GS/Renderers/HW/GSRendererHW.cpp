@@ -155,7 +155,10 @@ GSTexture* GSRendererHW::GetOutput(int i, float& scale, int& y_offset)
 
 	// Try to avoid broken/incomplete setups which are probably ignored on console, but can cause us problems.
 	if (curFramebuffer.framebufferRect.rempty() || curFramebuffer.FBW == 0 || framebufferSize.x < 0 || framebufferSize.y < 0)
+	{
+		GSObserveTemporalDisplay(i, {0, nullptr, static_cast<u32>(curFramebuffer.PSM)});
 		return nullptr;
+	}
 
 	PCRTCDisplays.RemoveFramebufferOffset(i);
 	// TRACE(_T("[%d] GetOutput %d %05x (%d)\n"), (int)m_perfmon.GetFrame(), i, (int)TEX0.TBP0, (int)TEX0.PSM);
@@ -172,6 +175,7 @@ GSTexture* GSRendererHW::GetOutput(int i, float& scale, int& y_offset)
 		const u32 bp_adj = (TEX0.TBP0 < rt->m_TEX0.TBP0 && rt->UnwrappedEndBlock() > GS_MAX_BLOCKS) ? (TEX0.TBP0 + GS_MAX_BLOCKS) : TEX0.TBP0;
 		rt->Update();
 		t = rt->m_texture;
+		GSObserveTemporalDisplay(i, {rt->m_observation_id, t, static_cast<u32>(rt->m_TEX0.PSM)});
 		scale = rt->m_scale;
 
 		const int delta = bp_adj - rt->m_TEX0.TBP0;
@@ -182,11 +186,14 @@ GSTexture* GSRendererHW::GetOutput(int i, float& scale, int& y_offset)
 			y_offset = y_pages * GSLocalMemory::m_psm[curFramebuffer.PSM].pgs.y;
 			GL_CACHE("HW: Frame y offset %d pixels, unit %d", y_offset, i);
 		}
-
 		if (GSConfig.SaveFrame && GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
 		{
 			t->Save(GetDrawDumpPath("%05lld_f%05lld_fr%d_%05x_%s.bmp", s_n, g_perfmon.GetFrame(), i, static_cast<int>(TEX0.TBP0), GSUtil::GetPSMName(TEX0.PSM)));
 		}
+	}
+	else
+	{
+		GSObserveTemporalDisplay(i, {0, nullptr, static_cast<u32>(TEX0.PSM)});
 	}
 
 	return t;
@@ -9546,7 +9553,25 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 	}
 
 	if (!m_channel_shuffle_width)
+	{
 		g_gs_device->RenderHW(m_conf);
+		if (GSHasTemporalDrawObserver())
+		{
+			GSTemporalDrawObservation observation;
+			observation.color = {rt && m_conf.rt == rt->m_texture ? rt->m_observation_id : 0,
+				m_conf.rt, rt ? static_cast<u32>(rt->m_TEX0.PSM) : 0};
+			observation.depth = {ds && m_conf.ds == ds->m_texture && !m_using_temp_z ? ds->m_observation_id : 0,
+				m_conf.ds, ds ? static_cast<u32>(ds->m_TEX0.PSM) : 0};
+			observation.gs_depth_test = m_cached_ctx.TEST.ZTST;
+			observation.hardware_depth_test = m_conf.depth.ztst;
+			observation.primitive_class = static_cast<u32>(m_vt.m_primclass);
+			observation.depth_test_enabled = m_cached_ctx.TEST.ZTE;
+			observation.depth_write_enabled = m_conf.depth.zwe;
+			observation.temporary_depth = ds && (m_using_temp_z || m_conf.ds != ds->m_texture);
+			observation.blending = m_conf.blend.enable;
+			GSObserveTemporalDraw(observation);
+		}
+	}
 	else
 		m_last_rt = rt;
 

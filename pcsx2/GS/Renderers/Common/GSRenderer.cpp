@@ -44,6 +44,7 @@ static std::deque<std::thread> s_screenshot_threads;
 static std::mutex s_screenshot_threads_mutex;
 
 static GSPresentationUpscaleHooks s_presentation_upscale_hooks;
+static GSTemporalObservationHooks s_temporal_observation_hooks;
 static std::atomic<u64> s_last_successful_present_id{0};
 
 std::unique_ptr<GSRenderer> g_gs_renderer;
@@ -51,6 +52,46 @@ std::unique_ptr<GSRenderer> g_gs_renderer;
 void GSSetPresentationUpscaleHooks(const GSPresentationUpscaleHooks& hooks)
 {
 	s_presentation_upscale_hooks = hooks;
+}
+
+void GSSetTemporalObservationHooks(const GSTemporalObservationHooks& hooks)
+{
+	s_temporal_observation_hooks = hooks;
+}
+
+bool GSHasTemporalDrawObserver()
+{
+	return s_temporal_observation_hooks.draw != nullptr;
+}
+
+void GSObserveTemporalDraw(const GSTemporalDrawObservation& observation)
+{
+	if (s_temporal_observation_hooks.draw)
+		s_temporal_observation_hooks.draw(s_temporal_observation_hooks.userdata, observation);
+}
+
+void GSObserveTemporalDisplay(int circuit, const GSTemporalTargetObservation& observation)
+{
+	if (s_temporal_observation_hooks.display)
+		s_temporal_observation_hooks.display(s_temporal_observation_hooks.userdata, circuit, observation);
+}
+
+static void ObserveTemporalPresent(GSTexture* texture, const GSVector4i& source_rect,
+	const GSVector4& destination_rect, u64 presentation_id, bool redraw, bool may_repeat)
+{
+	if (s_temporal_observation_hooks.present)
+	{
+		const GSTemporalPresentObservation observation{
+			texture, source_rect, destination_rect, presentation_id, redraw, may_repeat};
+		s_temporal_observation_hooks.present(s_temporal_observation_hooks.userdata, observation);
+	}
+}
+
+static void ObserveTemporalPresented(u64 presentation_id, bool succeeded, bool skipped, bool redraw)
+{
+	if (s_temporal_observation_hooks.presented)
+		s_temporal_observation_hooks.presented(
+			s_temporal_observation_hooks.userdata, presentation_id, succeeded, skipped, redraw);
 }
 
 u64 GSGetLastSuccessfulPresentId()
@@ -732,6 +773,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	}
 
 	const bool blank_frame = !Merge(field);
+	const u64 temporal_presentation_id = GSGetLastSuccessfulPresentId() + 1;
 
 	m_last_draw_n = s_n;
 	m_last_transfer_n = s_transfer_n;
@@ -743,6 +785,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			EndPresentFrame();
 
 		PerformanceMetrics::Update(registers_written, fb_sprite_frame, skip_frame);
+		ObserveTemporalPresented(temporal_presentation_id, false, true, false);
 	}
 	else
 	{
@@ -768,6 +811,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				GetVideoMode() == GSVideoMode::SDTV_480P);
 			s_last_draw_rect = draw_rect;
 
+			ObserveTemporalPresent(current, src_rect, draw_rect, temporal_presentation_id, false, idle_frame);
 			upscale_attempt = TryPresentationUpscale(current, src_rect, src_uv, draw_rect, false, idle_frame);
 
 			if (GSConfig.CASMode != GSCASMode::Disabled)
@@ -813,6 +857,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 
 		NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, current, src_rect, src_uv, draw_rect, false, idle_frame);
 		CompletePresentationUpscale(upscale_attempt, present_succeeded);
+		ObserveTemporalPresented(temporal_presentation_id, present_succeeded, false, false);
 		PerformanceMetrics::Update(registers_written, fb_sprite_frame, false);
 	}
 
@@ -1096,7 +1141,8 @@ void GSRenderer::PresentCurrentFrame()
 	GSTexture* current = nullptr;
 	GSVector4i src_rect;
 	GSVector4 src_uv, draw_rect;
-	if (s_presentation_upscale_hooks.upscale && g_gs_device->HasSurface() &&
+	const u64 temporal_presentation_id = GSGetLastSuccessfulPresentId() + 1;
+	if ((s_presentation_upscale_hooks.upscale || s_temporal_observation_hooks.present) && g_gs_device->HasSurface() &&
 		(current = g_gs_device->GetCurrent()))
 	{
 		src_rect = CalculateDrawSrcRect(current, m_real_size);
@@ -1104,6 +1150,7 @@ void GSRenderer::PresentCurrentFrame()
 		draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
 			src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
 			GetVideoMode() == GSVideoMode::SDTV_480P);
+		ObserveTemporalPresent(current, src_rect, draw_rect, temporal_presentation_id, true, true);
 		upscale_attempt = TryPresentationUpscale(current, src_rect, src_uv, draw_rect, true, true);
 	}
 
@@ -1138,6 +1185,7 @@ void GSRenderer::PresentCurrentFrame()
 	}
 	NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, current, src_rect, src_uv, draw_rect, true, true);
 	CompletePresentationUpscale(upscale_attempt, present_succeeded);
+	ObserveTemporalPresented(temporal_presentation_id, present_succeeded, false, true);
 }
 
 void GSTranslateWindowToDisplayCoordinates(float window_x, float window_y, float* display_x, float* display_y)

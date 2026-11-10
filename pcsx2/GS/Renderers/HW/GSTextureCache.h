@@ -234,6 +234,7 @@ public:
 	{
 	public:
 		const int m_type = 0;
+		const u64 m_observation_id;
 		int m_alpha_max = 0;
 		int m_alpha_min = 0;
 		bool m_alpha_range = false;

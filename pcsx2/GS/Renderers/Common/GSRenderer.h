@@ -59,6 +59,54 @@ enum class GSPresentationUpscaleStatus
 // configuration change, resize, or device destruction; copy it before then if needed.
 void GSSetPresentationUpscaleHooks(const GSPresentationUpscaleHooks& hooks);
 
+// Optional, metadata-only observations. Callbacks run in GS order and borrow textures
+// only for the duration of the call; target/texture IDs are process-local, not addresses.
+struct GSTemporalTargetObservation
+{
+	u64 target_id = 0;
+	GSTexture* texture = nullptr;
+	u32 gs_format = 0;
+};
+
+struct GSTemporalDrawObservation
+{
+	GSTemporalTargetObservation color;
+	GSTemporalTargetObservation depth;
+	u32 gs_depth_test = 0;
+	u32 hardware_depth_test = 0;
+	u32 primitive_class = 0;
+	bool depth_test_enabled = false;
+	bool depth_write_enabled = false;
+	bool temporary_depth = false;
+	bool blending = false;
+};
+
+struct GSTemporalPresentObservation
+{
+	GSTexture* texture = nullptr;
+	GSVector4i source_rect = GSVector4i::zero();
+	GSVector4 destination_rect = GSVector4::zero();
+	u64 presentation_id = 0;
+	bool is_redraw = false;
+	bool source_may_repeat = false;
+};
+
+struct GSTemporalObservationHooks
+{
+	void* userdata = nullptr;
+	void (*draw)(void*, const GSTemporalDrawObservation&) = nullptr;
+	void (*display)(void*, int circuit, const GSTemporalTargetObservation&) = nullptr;
+	void (*present)(void*, const GSTemporalPresentObservation&) = nullptr;
+	void (*presented)(void*, u64 presentation_id, bool succeeded, bool skipped, bool is_redraw) = nullptr;
+};
+
+// Register/clear on the GS thread, or while it is stopped. Observations do not
+// establish that a target, depth surface, or draw belongs to the displayed world.
+void GSSetTemporalObservationHooks(const GSTemporalObservationHooks& hooks);
+bool GSHasTemporalDrawObserver();
+void GSObserveTemporalDraw(const GSTemporalDrawObservation& observation);
+void GSObserveTemporalDisplay(int circuit, const GSTemporalTargetObservation& observation);
+
 // Process-wide, monotonically increasing identity of the last renderer-driven present
 // accepted by the graphics API (scheduled on Metal), not the queued VSync count or a
 // guarantee of scanout. Starts at zero; failed/skipped presents do not advance it.

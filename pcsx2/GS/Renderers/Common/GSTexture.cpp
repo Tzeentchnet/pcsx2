@@ -11,8 +11,14 @@
 
 #include <bit>
 #include <bitset>
+#include <atomic>
 
-GSTexture::GSTexture() = default;
+static std::atomic<u64> s_texture_observation_id{0};
+
+GSTexture::GSTexture()
+	: m_observation_id(s_texture_observation_id.fetch_add(1, std::memory_order_relaxed) + 1)
+{
+}
 
 GSTexture::~GSTexture() = default;
 
