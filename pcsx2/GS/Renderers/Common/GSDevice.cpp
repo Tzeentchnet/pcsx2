@@ -997,6 +997,7 @@ void GSDevice::SortMultiStretchRects(MultiStretchRect* rects, u32 num_rects)
 void GSDevice::ClearCurrent()
 {
 	m_current = nullptr;
+	m_current_before_sharp = nullptr;
 
 	delete m_merge;
 	delete m_weavebob;
@@ -1015,6 +1016,7 @@ void GSDevice::ClearCurrent()
 
 void GSDevice::Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c)
 {
+	m_current_before_sharp = nullptr;
 	if (ResizeRenderTarget(&m_merge, fs.x, fs.y, false, false))
 		DoMerge(sTex, sRect, m_merge, dRect, PMODE, EXTBUF, c, BilnIf(GSConfig.PCRTCOffsets));
 
@@ -1117,28 +1119,61 @@ void GSDevice::ShadeBoost()
 	}
 }
 
-void GSDevice::Resize(int width, int height)
+GSVector2i GSDevice::CalculateResizeTargetSize(const GSVector2i& source, int width, int height)
 {
-	GSTexture*& dTex = (m_current == m_target_tmp) ? m_merge : m_target_tmp;
-	GSVector2i s = m_current->GetSize();
+	if (source.x <= 0 || source.y <= 0)
+		return source;
+
+	GSVector2i s = source;
 	int multiplier = 1;
 
 	if ((width > s.x || height > s.y))
 	{
 		while (width > s.x || height > s.y)
 		{
-			s = m_current->GetSize() * GSVector2i(++multiplier);
+			s = source * GSVector2i(++multiplier);
 		}
 	}
 	else
 		s = GSVector2i(width, height);
 
+	return s;
+}
+
+void GSDevice::Resize(int width, int height)
+{
+	GSTexture*& dTex = (m_current == m_target_tmp) ? m_merge : m_target_tmp;
+	const GSVector2i s = CalculateResizeTargetSize(m_current->GetSize(), width, height);
 	if (ResizeRenderTarget(&dTex, s.x, s.y, false, false))
 	{
 		const GSVector4 sRect(0, 0, 1, 1);
 		const GSVector4 dRect(0, 0, s.x, s.y);
 		StretchRectAuto(m_current, sRect, dTex, dRect, Nearest);
 		m_current = dTex;
+	}
+}
+
+void GSDevice::ResizeForSharp(int width, int height)
+{
+	GSTexture* const source = GetCurrentBeforeSharp();
+	if (!source)
+		return;
+
+	const GSVector2i target_size = CalculateResizeTargetSize(source->GetSize(), width, height);
+	if (m_current_before_sharp && m_current->GetSize() == target_size)
+		return;
+
+	m_current = source;
+	Resize(width, height);
+	m_current_before_sharp = (m_current != source) ? source : nullptr;
+}
+
+void GSDevice::RestoreCurrentBeforeSharp()
+{
+	if (m_current_before_sharp)
+	{
+		m_current = m_current_before_sharp;
+		m_current_before_sharp = nullptr;
 	}
 }
 

@@ -2607,7 +2607,30 @@ void GSDeviceVK::SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle)
 	}
 }
 
+bool GSDeviceVK::IsValidPresentationTexture(const GSTexture* texture) const
+{
+	const GSTextureVK* const vk_texture = static_cast<const GSTextureVK*>(texture);
+	return texture->GetState() != GSTexture::State::Invalidated &&
+		vk_texture->GetLayout() != GSTextureVK::Layout::Undefined &&
+		(texture->GetState() != GSTexture::State::Cleared || texture->IsRenderTarget());
+}
+
+void GSDeviceVK::PreparePresentSource(GSTexture* texture)
+{
+	pxAssertRel(!m_is_presenting, "Cannot prepare a texture inside the present render pass");
+	GSTextureVK* const vk_texture = static_cast<GSTextureVK*>(texture);
+	EndRenderPass();
+	vk_texture->CommitClear();
+	vk_texture->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+}
+
 GSDevice::PresentResult GSDeviceVK::BeginPresent(bool frame_skip)
+{
+	return BeginPresentWithPreparation(frame_skip, {});
+}
+
+GSDevice::PresentResult GSDeviceVK::BeginPresentWithPreparation(
+	bool frame_skip, const std::function<void()>& preparation)
 {
 	EndRenderPass();
 
@@ -2669,6 +2692,9 @@ GSDevice::PresentResult GSDeviceVK::BeginPresent(bool frame_skip)
 		}
 	}
 
+	if (preparation)
+		preparation();
+
 	VkCommandBuffer cmdbuffer = GetCurrentCommandBuffer();
 
 	// Swap chain images start in undefined
@@ -2679,7 +2705,7 @@ GSDevice::PresentResult GSDeviceVK::BeginPresent(bool frame_skip)
 	// Present render pass gets started out here, so we can't transition source textures in DoStretchRect
 	// Make sure they're ready now
 	if (!frame_skip && m_current)
-		static_cast<GSTextureVK*>(m_current)->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+		PreparePresentSource(m_current);
 
 	const VkFramebuffer fb = swap_chain_texture->GetFramebuffer(false);
 	if (fb == VK_NULL_HANDLE)
@@ -3461,6 +3487,11 @@ void GSDeviceVK::DoStretchRect(GSTextureVK* sTex, const GSVector4& sRect, GSText
 {
 	if (sTex->GetLayout() != GSTextureVK::Layout::ShaderReadOnly)
 	{
+		if (m_is_presenting)
+		{
+			ERROR_LOG("VK: Present source was not prepared before the render pass.");
+			return;
+		}
 		// can't transition in a render pass
 		EndRenderPass();
 		sTex->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);

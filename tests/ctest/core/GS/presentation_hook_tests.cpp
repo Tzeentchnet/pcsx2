@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSRenderer.h"
 
 #include <gtest/gtest.h>
@@ -149,4 +150,12 @@ TEST(GSPresentationHook, InvalidInputDoesNotCallHook)
 	frame.destination_rect.z = std::numeric_limits<float>::quiet_NaN();
 	EXPECT_EQ(GSApplyPresentationUpscaleHook(hooks, frame), GSPresentationUpscaleStatus::NotCalled);
 	EXPECT_EQ(state.calls, 0);
+}
+
+TEST(GSPresentationHook, SharpResizePreservesIntegerScaleAndHandlesEmptySource)
+{
+	EXPECT_TRUE(GSDevice::CalculateResizeTargetSize(GSVector2i(640, 448), 1201, 801) == GSVector2i(1280, 896));
+	EXPECT_TRUE(GSDevice::CalculateResizeTargetSize(GSVector2i(640, 448), 320, 224) == GSVector2i(320, 224));
+	EXPECT_TRUE(GSDevice::CalculateResizeTargetSize(GSVector2i(0, 448), 1201, 801) == GSVector2i(0, 448));
+	EXPECT_TRUE(GSDevice::CalculateResizeTargetSize(GSVector2i(640, 0), 1201, 801) == GSVector2i(640, 0));
 }

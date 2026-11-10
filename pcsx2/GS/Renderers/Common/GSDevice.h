@@ -13,6 +13,7 @@
 #include "GS/GSAlignedClass.h"
 #include "GS/GSExtra.h"
 #include <array>
+#include <functional>
 #include <span>
 
 enum class Filter
@@ -1497,6 +1498,7 @@ protected:
 	GSTexture* m_mad = nullptr;
 	GSTexture* m_target_tmp = nullptr;
 	GSTexture* m_current = nullptr;
+	GSTexture* m_current_before_sharp = nullptr;
 	GSTexture* m_cas = nullptr;
 	GSTexture* m_colclip_rt = nullptr; ///< Temp hw colclip texture
 	GSTexture* m_ds_as_rt = nullptr; ///< Depth as color
@@ -1581,6 +1583,10 @@ public:
 	__fi bool IsPresentThrottleAllowed() const { return m_allow_present_throttle; }
 
 	__fi GSTexture* GetCurrent() const { return m_current; }
+	__fi GSTexture* GetCurrentBeforeSharp() const
+	{
+		return m_current_before_sharp ? m_current_before_sharp : m_current;
+	}
 	__fi GSTexture* GetMAD() const { return m_mad; }
 	
 	void Recycle(GSTexture* t);
@@ -1615,6 +1621,19 @@ public:
 	/// Returns false if the window was completely occluded. If frame_skip is set, the frame won't be
 	/// displayed, but the GPU command queue will still be flushed.
 	virtual PresentResult BeginPresent(bool frame_skip) = 0;
+
+	/// Runs preparation before the present render pass. Backends that recreate their swapchain
+	/// in BeginPresent must invoke it after recreation, with the current window size.
+	virtual PresentResult BeginPresentWithPreparation(bool frame_skip, const std::function<void()>& preparation)
+	{
+		if (!frame_skip && preparation)
+			preparation();
+		return BeginPresent(frame_skip);
+	}
+
+	/// Validates and prepares an integration output before the present render pass.
+	virtual bool IsValidPresentationTexture(const GSTexture* texture) const { return true; }
+	virtual void PreparePresentSource(GSTexture* texture) {}
 
 	/// Presents the frame. Implementations record whether the graphics API accepted/scheduled it.
 	virtual void EndPresent() = 0;
@@ -1722,6 +1741,10 @@ public:
 	void FXAA();
 	void ShadeBoost();
 	void Resize(int width, int height);
+	static GSVector2i CalculateResizeTargetSize(const GSVector2i& source, int width, int height);
+	void ResizeForSharp(int width, int height);
+	void RestoreCurrentBeforeSharp();
+	void ForgetCurrentBeforeSharp() { m_current_before_sharp = nullptr; }
 
 	void CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool sharpen_only);
 

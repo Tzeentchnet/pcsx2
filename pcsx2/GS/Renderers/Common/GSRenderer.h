@@ -4,6 +4,7 @@
 #pragma once
 
 #include "GS/GSState.h"
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -45,13 +46,19 @@ enum class GSPresentationUpscaleStatus
 // remain alive until they are cleared and all in-flight callbacks have returned. Callbacks
 // must not re-enter presentation or change the registration.
 //
-// upscale runs after merge/crop and before the present render pass. It must not modify the
-// source; on success it supplies a distinct, sample-ready texture and a rectangle in pixels.
+// upscale runs after merge/crop, before sharp-bilinear prescaling and the present render pass.
+// It must not modify the source; on success it supplies a distinct texture owned by the
+// same device, with valid contents and a rectangle in pixels. On Vulkan, the texture's
+// tracked GSTextureVK layout must match its actual layout and must not be Undefined; writes
+// must be recorded and synchronized on the device's current queue (e.g. using
+// ExecuteExternalCommands). A deferred clear must belong to a render target.
 // The supplied output rectangle must have valid contents and remain valid through
 // presentation and until its GPU use completes.
 // presented pairs with every upscale call, including failures and skipped/device-lost
 // presents. A failed present does not consume presentation_id; consumers must discard or
-// reset speculative temporal history. Device destruction can occur before a pending
+// reset speculative temporal history. A resize can discard a successful upscale and present
+// the recalculated fallback; then succeeded is true and used_upscaled_output is false.
+// Device destruction can occur before a pending
 // completion callback; it must not use destroyed device resources. Redraws are explicitly
 // identified in the frame. After a successful upscaled present, presented_frame receives
 // the actual post-processing input used for presentation, including its source and
@@ -127,7 +134,8 @@ class GSRenderer : public GSState
 {
 private:
 	bool Merge(int field);
-	bool BeginPresentFrame(bool frame_skip);
+	void ApplySharpBilinearFallback(const GSVector2i& real_size);
+	bool BeginPresentFrame(bool frame_skip, const std::function<void()>& preparation = {});
 	bool EndPresentFrame();
 
 	u64 m_shader_time_start = 0;
@@ -136,6 +144,8 @@ private:
 	u32 m_dump_frames = 0;
 	u32 m_skipped_duplicate_frames = 0;
 	bool m_saving_metrics = false;
+	// Captures/readbacks retain the legacy sharp-prescaled source, independent of the hook.
+	bool m_sharp_prescale_deferred = false;
 
 	// Tracking draw counters for idle frame detection.
 	u64 m_last_draw_n = 0;

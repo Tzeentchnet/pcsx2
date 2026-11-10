@@ -643,6 +643,9 @@ public:
 	void SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle) override;
 
 	PresentResult BeginPresent(bool frame_skip) override;
+	PresentResult BeginPresentWithPreparation(bool frame_skip, const std::function<void()>& preparation) override;
+	bool IsValidPresentationTexture(const GSTexture* texture) const override;
+	void PreparePresentSource(GSTexture* texture) override;
 	void EndPresent() override;
 	bool IsPresenting() const;
 

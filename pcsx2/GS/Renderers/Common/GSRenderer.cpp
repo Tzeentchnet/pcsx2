@@ -118,7 +118,8 @@ GSPresentationUpscaleStatus GSApplyPresentationUpscaleHook(
 
 	GSPresentationUpscaleOutput output;
 	if (!hooks.upscale(hooks.userdata, frame, output) || !output.texture || output.texture == frame.texture ||
-		output.texture->IsDepthLike() || !IsValidPresentationRect(output.source_rect, output.texture))
+		output.texture->IsDepthLike() || !IsValidPresentationRect(output.source_rect, output.texture) ||
+		(frame.device && !frame.device->IsValidPresentationTexture(output.texture)))
 	{
 		return GSPresentationUpscaleStatus::Failed;
 	}
@@ -158,20 +159,20 @@ static PresentationUpscaleAttempt TryPresentationUpscale(
 	return attempt;
 }
 
-static void CompletePresentationUpscale(const PresentationUpscaleAttempt& attempt, bool succeeded)
+static void CompletePresentationUpscale(
+	const PresentationUpscaleAttempt& attempt, bool succeeded, bool used_upscaled_output)
 {
 	if (attempt.status != GSPresentationUpscaleStatus::NotCalled && attempt.hooks.presented)
 	{
-		attempt.hooks.presented(attempt.hooks.userdata, attempt.presentation_id, succeeded,
-			attempt.status == GSPresentationUpscaleStatus::Applied);
+		attempt.hooks.presented(attempt.hooks.userdata, attempt.presentation_id, succeeded, used_upscaled_output);
 	}
 }
 
-static void NotifyPresentedUpscaleFrame(const PresentationUpscaleAttempt& attempt, bool succeeded,
+static void NotifyPresentedUpscaleFrame(const PresentationUpscaleAttempt& attempt, bool succeeded, bool used_upscaled_output,
 	GSTexture* texture, const GSVector4i& src_rect, const GSVector4& src_uv, const GSVector4& draw_rect,
 	bool is_redraw, bool source_may_repeat)
 {
-	if (succeeded && attempt.status == GSPresentationUpscaleStatus::Applied && attempt.hooks.presented_frame)
+	if (succeeded && used_upscaled_output && attempt.hooks.presented_frame)
 	{
 		const GSPresentationUpscaleFrame frame = {
 			g_gs_device.get(), texture, src_rect, src_uv, draw_rect, attempt.presentation_id, is_redraw, source_may_repeat};
@@ -201,7 +202,10 @@ void GSRenderer::Reset(bool hardware_reset)
 {
 	// Clear the current display texture.
 	if (hardware_reset)
+	{
 		g_gs_device->ClearCurrent();
+		m_sharp_prescale_deferred = false;
+	}
 
 	GSState::Reset(hardware_reset);
 }
@@ -213,6 +217,46 @@ void GSRenderer::Destroy()
 
 void GSRenderer::UpdateRenderFixes()
 {
+}
+
+void GSRenderer::ApplySharpBilinearFallback(const GSVector2i& real_size)
+{
+	m_sharp_prescale_deferred = false;
+	if (!g_gs_device->GetCurrent())
+		return;
+
+	if (GSConfig.LinearPresent == GSPostBilinearMode::BilinearSharp &&
+		(g_gs_device->GetWindowWidth() > real_size.x || g_gs_device->GetWindowHeight() > real_size.y))
+	{
+		g_gs_device->ResizeForSharp(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight());
+	}
+	else
+	{
+		g_gs_device->RestoreCurrentBeforeSharp();
+	}
+}
+
+static void ApplyPresentationCAS(
+	GSTexture*& current, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool upscaled)
+{
+	if (GSConfig.CASMode == GSCASMode::Disabled)
+		return;
+
+	static bool cas_log_once = false;
+	if (g_gs_device->Features().cas_sharpening)
+	{
+		const bool sharpen_only = (upscaled || GSConfig.CASMode == GSCASMode::SharpenOnly ||
+			(current->GetWidth() > g_gs_device->GetWindowWidth() &&
+				current->GetHeight() > g_gs_device->GetWindowHeight()));
+		g_gs_device->CAS(current, src_rect, src_uv, draw_rect, sharpen_only);
+	}
+	else if (!cas_log_once)
+	{
+		Host::AddIconOSDMessage("CASUnsupported", ICON_FA_TRIANGLE_EXCLAMATION,
+			TRANSLATE_SV("GS", "CAS is not available, your graphics driver does not support the required functionality."),
+			10.0f);
+		cas_log_once = true;
+	}
 }
 
 bool GSRenderer::Merge(int field)
@@ -385,11 +429,12 @@ bool GSRenderer::Merge(int field)
 	if (GSConfig.FXAA)
 		g_gs_device->FXAA();
 
-	// Sharpens biinear at lower resolutions, almost nearest but with more uniform pixels.
-	if (GSConfig.LinearPresent == GSPostBilinearMode::BilinearSharp && (g_gs_device->GetWindowWidth() > fs.x || g_gs_device->GetWindowHeight() > fs.y))
-	{
-		g_gs_device->Resize(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight());
-	}
+	// Preserve the ordinary presentation path when no integration is registered.
+	if (!s_presentation_upscale_hooks.upscale)
+		ApplySharpBilinearFallback(fs);
+	else
+		m_sharp_prescale_deferred = (GSConfig.LinearPresent == GSPostBilinearMode::BilinearSharp &&
+			(g_gs_device->GetWindowWidth() > fs.x || g_gs_device->GetWindowHeight() > fs.y));
 
 	if (m_scanmask_used)
 		m_scanmask_used--;
@@ -576,9 +621,8 @@ static GSVector4 CalculateDrawDstRect(s32 window_width, s32 window_height, const
 	return ret;
 }
 
-static GSVector4i CalculateDrawSrcRect(const GSTexture* src, const GSVector2i real_size)
+static GSVector4i CalculateDrawSrcRect(const GSVector2i size, const GSVector2i real_size)
 {
-	const GSVector2i size(src->GetSize());
 	const GSVector2 scale = GSVector2(size.x, size.y) / GSVector2(real_size.x, real_size.y).max(GSVector2(0.1f, 0.1f));
 	const float upscale = GSIsHardwareRenderer() ? GSConfig.UpscaleMultiplier : 1;
 	const int left = static_cast<int>(static_cast<float>(GSConfig.Crop[0] * scale.x) * upscale);
@@ -586,6 +630,28 @@ static GSVector4i CalculateDrawSrcRect(const GSTexture* src, const GSVector2i re
 	const int right =  size.x - static_cast<int>(static_cast<float>(GSConfig.Crop[2] * scale.x) * upscale);
 	const int bottom = size.y - static_cast<int>(static_cast<float>(GSConfig.Crop[3] * scale.y) * upscale);
 	return GSVector4i(left, top, right, bottom);
+}
+
+static GSVector4i CalculateDrawSrcRect(const GSTexture* src, const GSVector2i real_size)
+{
+	return CalculateDrawSrcRect(src->GetSize(), real_size);
+}
+
+static GSVector4 CalculatePresentationDstRect(const GSTexture* source, const GSVector4i& source_rect,
+	const GSVector2i& real_size, bool before_sharp, bool is_progressive)
+{
+	const int window_width = g_gs_device->GetWindowWidth();
+	const int window_height = g_gs_device->GetWindowHeight();
+	GSVector2i geometry_size = source->GetSize();
+	GSVector4i geometry_rect = source_rect;
+	if (before_sharp && GSConfig.LinearPresent == GSPostBilinearMode::BilinearSharp &&
+		(window_width > real_size.x || window_height > real_size.y))
+	{
+		geometry_size = GSDevice::CalculateResizeTargetSize(geometry_size, window_width, window_height);
+		geometry_rect = CalculateDrawSrcRect(geometry_size, real_size);
+	}
+	return CalculateDrawDstRect(window_width, window_height, geometry_rect, geometry_size,
+		s_display_alignment, g_gs_device->UsesLowerLeftOrigin(), is_progressive);
 }
 
 static const char* GetScreenshotSuffix()
@@ -656,14 +722,14 @@ void GSJoinSnapshotThreads()
 	}
 }
 
-bool GSRenderer::BeginPresentFrame(bool frame_skip)
+bool GSRenderer::BeginPresentFrame(bool frame_skip, const std::function<void()>& preparation)
 {
 	Host::BeginPresentFrame();
 
 	if (GSDumpReplayer::IsReplayingDump())
 		GSDumpReplayer::UpdateGSStats();
 
-	const GSDevice::PresentResult res = g_gs_device->BeginPresent(frame_skip);
+	const GSDevice::PresentResult res = g_gs_device->BeginPresentWithPreparation(frame_skip, preparation);
 	if (res == GSDevice::PresentResult::FrameSkipped)
 	{
 		// If we're skipping a frame, we need to reset imgui's state, since
@@ -781,6 +847,8 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	// Skip presentation when running uncapped while vsync is on.
 	if (skip_frame || g_gs_device->ShouldSkipPresentingFrame())
 	{
+		if (!blank_frame)
+			ApplySharpBilinearFallback(m_real_size);
 		if (BeginPresentFrame(true))
 			EndPresentFrame();
 
@@ -800,44 +868,57 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		// Little bit ugly, but we can't do CAS inside the render pass.
 		GSVector4i src_rect;
 		GSVector4 src_uv, draw_rect;
-		GSTexture* current = g_gs_device->GetCurrent();
+		const bool try_hook = s_presentation_upscale_hooks.upscale && g_gs_device->HasSurface();
+		GSTexture* current = try_hook ? g_gs_device->GetCurrentBeforeSharp() : g_gs_device->GetCurrent();
 		PresentationUpscaleAttempt upscale_attempt;
 		if (current && !blank_frame)
 		{
 			src_rect = CalculateDrawSrcRect(current, m_real_size);
 			src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
-			draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
-				src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
+			draw_rect = CalculatePresentationDstRect(current, src_rect, m_real_size, try_hook,
 				GetVideoMode() == GSVideoMode::SDTV_480P);
-			s_last_draw_rect = draw_rect;
 
 			ObserveTemporalPresent(current, src_rect, draw_rect, temporal_presentation_id, false, idle_frame);
 			upscale_attempt = TryPresentationUpscale(current, src_rect, src_uv, draw_rect, false, idle_frame);
-
-			if (GSConfig.CASMode != GSCASMode::Disabled)
+			if (upscale_attempt.status != GSPresentationUpscaleStatus::Applied)
 			{
-				static bool cas_log_once = false;
-				if (g_gs_device->Features().cas_sharpening)
-				{
-					// sharpen only if the IR is higher than the display resolution
-					const bool sharpen_only = (upscale_attempt.status == GSPresentationUpscaleStatus::Applied ||
-					                           GSConfig.CASMode == GSCASMode::SharpenOnly ||
-					                           (current->GetWidth() > g_gs_device->GetWindowWidth() &&
-					                            current->GetHeight() > g_gs_device->GetWindowHeight()));
-					g_gs_device->CAS(current, src_rect, src_uv, draw_rect, sharpen_only);
-				}
-				else if (!cas_log_once)
-				{
-					Host::AddIconOSDMessage("CASUnsupported", ICON_FA_TRIANGLE_EXCLAMATION,
-						TRANSLATE_SV("GS", "CAS is not available, your graphics driver does not support the required functionality."),
-						10.0f);
-					cas_log_once = true;
-				}
+				ApplySharpBilinearFallback(m_real_size);
+				current = g_gs_device->GetCurrent();
+				src_rect = CalculateDrawSrcRect(current, m_real_size);
+				src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
+				draw_rect = CalculatePresentationDstRect(current, src_rect, m_real_size, false,
+					GetVideoMode() == GSVideoMode::SDTV_480P);
 			}
+			s_last_draw_rect = draw_rect;
+
+			ApplyPresentationCAS(current, src_rect, src_uv, draw_rect,
+				upscale_attempt.status == GSPresentationUpscaleStatus::Applied);
 		}
 
+		bool used_upscaled_output = (upscale_attempt.status == GSPresentationUpscaleStatus::Applied);
 		bool present_succeeded = false;
-		if (BeginPresentFrame(false))
+		const GSVector2i before_present_size = g_gs_device->GetWindowSize();
+		const auto prepare_present = [&]() {
+			if (!current || blank_frame)
+				return;
+
+			if (before_present_size != g_gs_device->GetWindowSize())
+			{
+				ApplySharpBilinearFallback(m_real_size);
+				current = g_gs_device->GetCurrent();
+				src_rect = CalculateDrawSrcRect(current, m_real_size);
+				src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
+				draw_rect = CalculatePresentationDstRect(current, src_rect, m_real_size, false,
+					GetVideoMode() == GSVideoMode::SDTV_480P);
+				used_upscaled_output = false;
+				s_last_draw_rect = draw_rect;
+				ObserveTemporalPresent(current, src_rect, draw_rect, temporal_presentation_id, false, idle_frame);
+				ApplyPresentationCAS(current, src_rect, src_uv, draw_rect, false);
+			}
+
+			g_gs_device->PreparePresentSource(current);
+		};
+		if (BeginPresentFrame(false, prepare_present))
 		{
 			if (current && !blank_frame)
 			{
@@ -855,8 +936,9 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			PerformanceMetrics::OnGPUPresent(gpu_time, gpu_stats.vs_invocations, gpu_stats.ps_invocations);
 		}
 
-		NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, current, src_rect, src_uv, draw_rect, false, idle_frame);
-		CompletePresentationUpscale(upscale_attempt, present_succeeded);
+		NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, used_upscaled_output,
+			current, src_rect, src_uv, draw_rect, false, idle_frame);
+		CompletePresentationUpscale(upscale_attempt, present_succeeded, used_upscaled_output);
 		ObserveTemporalPresented(temporal_presentation_id, present_succeeded, false, false);
 		PerformanceMetrics::Update(registers_written, fb_sprite_frame, false);
 	}
@@ -869,6 +951,9 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 
 		if (GSConfig.LinearPresent == GSPostBilinearMode::BilinearSharp)
 		{
+			if (m_sharp_prescale_deferred)
+				ApplySharpBilinearFallback(m_real_size);
+			g_gs_device->ForgetCurrentBeforeSharp();
 			const GSTexture* current = g_gs_device->GetCurrent();
 			const GSVector2i internal_res = GetInternalResolution();
 
@@ -967,6 +1052,8 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	// capture
 	if (GSCapture::IsCapturingVideo())
 	{
+		if (m_sharp_prescale_deferred)
+			ApplySharpBilinearFallback(m_real_size);
 		const GSVector2i size = GSCapture::GetSize();
 		if (GSTexture* current = g_gs_device->GetCurrent())
 		{
@@ -1142,34 +1229,54 @@ void GSRenderer::PresentCurrentFrame()
 	GSVector4i src_rect;
 	GSVector4 src_uv, draw_rect;
 	const u64 temporal_presentation_id = GSGetLastSuccessfulPresentId() + 1;
+	const bool try_hook = s_presentation_upscale_hooks.upscale && g_gs_device->HasSurface();
+	if (!try_hook && m_sharp_prescale_deferred)
+		ApplySharpBilinearFallback(m_real_size);
 	if ((s_presentation_upscale_hooks.upscale || s_temporal_observation_hooks.present) && g_gs_device->HasSurface() &&
-		(current = g_gs_device->GetCurrent()))
+		(current = try_hook ? g_gs_device->GetCurrentBeforeSharp() : g_gs_device->GetCurrent()))
 	{
 		src_rect = CalculateDrawSrcRect(current, m_real_size);
 		src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
-		draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
-			src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
+		draw_rect = CalculatePresentationDstRect(current, src_rect, m_real_size, try_hook,
 			GetVideoMode() == GSVideoMode::SDTV_480P);
 		ObserveTemporalPresent(current, src_rect, draw_rect, temporal_presentation_id, true, true);
 		upscale_attempt = TryPresentationUpscale(current, src_rect, src_uv, draw_rect, true, true);
 	}
 
-	bool present_succeeded = false;
-	if (BeginPresentFrame(false))
+	bool used_upscaled_output = (upscale_attempt.status == GSPresentationUpscaleStatus::Applied);
+	if (!used_upscaled_output)
 	{
-		if (upscale_attempt.status != GSPresentationUpscaleStatus::Applied)
+		if (try_hook)
+			ApplySharpBilinearFallback(m_real_size);
+		current = g_gs_device->GetCurrent();
+	}
+
+	bool present_succeeded = false;
+	const GSVector2i before_present_size = g_gs_device->GetWindowSize();
+	const auto prepare_present = [&]() {
+		const bool resized = before_present_size != g_gs_device->GetWindowSize();
+		if (!used_upscaled_output || resized)
 		{
+			if (resized)
+				ApplySharpBilinearFallback(m_real_size);
+			used_upscaled_output = false;
 			current = g_gs_device->GetCurrent();
 			if (current)
 			{
 				src_rect = CalculateDrawSrcRect(current, m_real_size);
 				src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
-				draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
-					src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
+				draw_rect = CalculatePresentationDstRect(current, src_rect, m_real_size, false,
 					GetVideoMode() == GSVideoMode::SDTV_480P);
+				if (resized)
+					ObserveTemporalPresent(current, src_rect, draw_rect, temporal_presentation_id, true, true);
 			}
 		}
 
+		if (current)
+			g_gs_device->PreparePresentSource(current);
+	};
+	if (BeginPresentFrame(false, prepare_present))
+	{
 		if (current)
 		{
 			s_last_draw_rect = draw_rect;
@@ -1183,8 +1290,9 @@ void GSRenderer::PresentCurrentFrame()
 
 		present_succeeded = EndPresentFrame();
 	}
-	NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, current, src_rect, src_uv, draw_rect, true, true);
-	CompletePresentationUpscale(upscale_attempt, present_succeeded);
+	NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, used_upscaled_output,
+		current, src_rect, src_uv, draw_rect, true, true);
+	CompletePresentationUpscale(upscale_attempt, present_succeeded, used_upscaled_output);
 	ObserveTemporalPresented(temporal_presentation_id, present_succeeded, false, true);
 }
 
@@ -1241,6 +1349,9 @@ bool GSRenderer::IsIdleFrame() const
 bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
 	u32* width, u32* height, std::vector<u32>* pixels)
 {
+	if (m_sharp_prescale_deferred)
+		ApplySharpBilinearFallback(m_real_size);
+
 	GSTexture* const current = g_gs_device->GetCurrent();
 	if (!current)
 	{
