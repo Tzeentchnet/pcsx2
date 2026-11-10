@@ -737,12 +737,77 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		Vulkan::AddPointerToChain(&device_info, &fragment_shader_interlock_ext_feature);
 	}
 
-	VkResult res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
-	if (res != VK_SUCCESS && enabled_extensions.size() > base_extension_count)
+	const VkPhysicalDeviceFeatures base_features = m_device_features;
+	const void* const base_feature_chain = device_info.pNext;
+	bool requested_features_enabled = true;
+	bool integration_features_applied = false;
+	if (m_integration_hooks.device_features)
 	{
-		Console.Warning("VK: Device creation with external extensions failed; retrying without them.");
+		IntegrationDeviceFeatures requested;
+		requested_features_enabled = m_integration_instance_extensions_enabled && requested_extensions_enabled &&
+			m_integration_hooks.device_features(m_integration_hooks.userdata, m_instance, m_physical_device, requested);
+
+		// VkPhysicalDeviceFeatures consists solely of VkBool32 members.
+		static_assert(sizeof(VkPhysicalDeviceFeatures) % sizeof(VkBool32) == 0);
+		constexpr size_t feature_count = sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32);
+		std::array<VkBool32, feature_count> available_bits{}, requested_bits{}, enabled_bits{};
+		VkPhysicalDeviceFeatures available_features = {};
+		vkGetPhysicalDeviceFeatures(m_physical_device, &available_features);
+		std::memcpy(available_bits.data(), &available_features, sizeof(available_features));
+		std::memcpy(requested_bits.data(), &requested.core, sizeof(requested.core));
+		std::memcpy(enabled_bits.data(), &m_device_features, sizeof(m_device_features));
+		for (size_t i = 0; i < feature_count; i++)
+		{
+			if (requested_bits[i] > VK_TRUE || (requested_bits[i] && !available_bits[i]))
+				requested_features_enabled = false;
+			enabled_bits[i] |= requested_bits[i];
+		}
+
+		std::vector<VkStructureType> chain_types;
+		for (const VkBaseInStructure* node = static_cast<const VkBaseInStructure*>(base_feature_chain);
+			 node; node = node->pNext)
+			chain_types.push_back(node->sType);
+		VkBaseOutStructure* last = nullptr;
+		for (VkBaseOutStructure* node = requested.extension_chain; node; node = node->pNext)
+		{
+			if (chain_types.size() >= 64 ||
+				std::find(chain_types.begin(), chain_types.end(), node->sType) != chain_types.end())
+			{
+				requested_features_enabled = false;
+				break;
+			}
+			chain_types.push_back(node->sType);
+			last = node;
+		}
+		if (requested_features_enabled)
+		{
+			std::memcpy(&m_device_features, enabled_bits.data(), sizeof(m_device_features));
+			if (last)
+			{
+				last->pNext = const_cast<VkBaseOutStructure*>(
+					static_cast<const VkBaseOutStructure*>(base_feature_chain));
+				device_info.pNext = requested.extension_chain;
+			}
+			integration_features_applied = true;
+		}
+		else
+		{
+			Console.Warning("VK: External device features unavailable; disabling integration requirements.");
+			enabled_extensions.resize(base_extension_count);
+			device_info.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
+			requested_extensions_enabled = false;
+		}
+	}
+
+	VkResult res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
+	if (res != VK_SUCCESS && (enabled_extensions.size() > base_extension_count || integration_features_applied))
+	{
+		Console.Warning("VK: Device creation with external requirements failed; retrying without them.");
 		device_info.enabledExtensionCount = static_cast<u32>(base_extension_count);
+		device_info.pNext = base_feature_chain;
+		m_device_features = base_features;
 		requested_extensions_enabled = false;
+		requested_features_enabled = false;
 		res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
 	}
 	if (res != VK_SUCCESS)
@@ -751,6 +816,7 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		return false;
 	}
 	m_integration_device_extensions_enabled = requested_extensions_enabled;
+	m_integration_device_features_enabled = requested_features_enabled;
 
 	// With the device created, we can fill the remaining entry points.
 	if (!Vulkan::LoadVulkanDeviceFunctions(m_device))
@@ -2346,7 +2412,8 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	if (m_integration_hooks.device_created)
 	{
 		m_integration_hooks.device_created(m_integration_hooks.userdata, *this,
-			m_integration_instance_extensions_enabled, m_integration_device_extensions_enabled);
+			m_integration_instance_extensions_enabled, m_integration_device_extensions_enabled,
+			m_integration_device_features_enabled);
 	}
 	return true;
 }
@@ -2359,11 +2426,9 @@ void GSDeviceVK::Destroy()
 	{
 		EndRenderPass();
 		if (GetCurrentCommandBuffer() != VK_NULL_HANDLE)
-		{
 			ExecuteCommandBuffer(false);
-			WaitForGPUIdle();
-		}
-		m_integration_hooks.device_destroying(m_integration_hooks.userdata, *this);
+		const VkResult idle_result = (m_device != VK_NULL_HANDLE) ? vkDeviceWaitIdle(m_device) : VK_ERROR_DEVICE_LOST;
+		m_integration_hooks.device_destroying(m_integration_hooks.userdata, *this, idle_result);
 	}
 	m_integration_active = false;
 

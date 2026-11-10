@@ -49,6 +49,12 @@ public:
 		bool vk_ext_fragment_shader_interlock : 1;
 	};
 
+	struct IntegrationDeviceFeatures
+	{
+		VkPhysicalDeviceFeatures core = {};
+		VkBaseOutStructure* extension_chain = nullptr;
+	};
+
 	struct IntegrationHooks
 	{
 		void* userdata = nullptr;
@@ -56,18 +62,24 @@ public:
 			std::vector<std::string>& requested) = nullptr;
 		void (*device_extensions)(void* userdata, VkInstance instance, VkPhysicalDevice physical_device,
 			const std::vector<VkExtensionProperties>& available, std::vector<std::string>& requested) = nullptr;
+		bool (*device_features)(void* userdata, VkInstance instance, VkPhysicalDevice physical_device,
+			IntegrationDeviceFeatures& requested) = nullptr;
 		void (*device_created)(void* userdata, GSDeviceVK& device,
-			bool instance_extensions_enabled, bool device_extensions_enabled) = nullptr;
-		void (*device_destroying)(void* userdata, GSDeviceVK& device) = nullptr;
+			bool instance_extensions_enabled, bool device_extensions_enabled, bool device_features_enabled) = nullptr;
+		void (*device_destroying)(void* userdata, GSDeviceVK& device, VkResult idle_result) = nullptr;
 	};
 
 	// Set before device creation, and clear only after its destruction. Hooks are snapshotted
 	// for each device and must not re-enter registration or Vulkan device creation. Extension
 	// callbacks supply names (including dependencies) from the enumerated available list.
-	// Requests are all-or-nothing and optional for PCSX2: unsupported names or a failed
-	// Vulkan create fall back to the original extension list. device_created reports whether
-	// each request was enabled; device_destroying runs after pending GPU work is flushed and
-	// before PCSX2 tears down the device. Callbacks and userdata must outlive the device.
+	// Requests are all-or-nothing and optional for PCSX2: unsupported names/features or a
+	// failed Vulkan create fall back to the original device configuration. device_features
+	// supplies already-queried extension feature structs, owned until device_created; their
+	// sTypes must not overlap PCSX2's feature chain. Core features are validated by PCSX2.
+	// device_created reports negotiation results. device_destroying runs before device
+	// destruction, after submitting pending work and waiting for idle. VK_SUCCESS proves GPU
+	// completion; VK_ERROR_DEVICE_LOST reports terminal device loss, not successful completion.
+	// Callbacks and userdata must outlive the device.
 	static void SetIntegrationHooks(const IntegrationHooks& hooks);
 
 	struct ExternalImage
@@ -306,6 +318,7 @@ private:
 	bool m_integration_active = false;
 	bool m_integration_instance_extensions_enabled = true;
 	bool m_integration_device_extensions_enabled = true;
+	bool m_integration_device_features_enabled = true;
 
 	VkCommandBuffer m_current_command_buffer = VK_NULL_HANDLE;
 
