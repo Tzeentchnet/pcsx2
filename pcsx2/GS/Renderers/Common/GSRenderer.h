@@ -79,6 +79,13 @@ struct GSTemporalDrawObservation
 	bool depth_write_enabled = false;
 	bool temporary_depth = false;
 	bool blending = false;
+
+	void SetDepthTests(const GIFRegTEST& guest_test, u32 hardware_test)
+	{
+		gs_depth_test = guest_test.ZTST;
+		hardware_depth_test = hardware_test;
+		depth_test_enabled = guest_test.ZTE;
+	}
 };
 
 struct GSTemporalPresentObservation

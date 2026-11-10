@@ -9562,10 +9562,8 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 				m_conf.rt, rt ? static_cast<u32>(rt->m_TEX0.PSM) : 0};
 			observation.depth = {ds && m_conf.ds == ds->m_texture && !m_using_temp_z ? ds->m_observation_id : 0,
 				m_conf.ds, ds ? static_cast<u32>(ds->m_TEX0.PSM) : 0};
-			observation.gs_depth_test = m_cached_ctx.TEST.ZTST;
-			observation.hardware_depth_test = m_conf.depth.ztst;
+			observation.SetDepthTests(m_context->TEST, m_conf.depth.ztst);
 			observation.primitive_class = static_cast<u32>(m_vt.m_primclass);
-			observation.depth_test_enabled = m_cached_ctx.TEST.ZTE;
 			observation.depth_write_enabled = m_conf.depth.zwe;
 			observation.temporary_depth = ds && (m_using_temp_z || m_conf.ds != ds->m_texture);
 			observation.blending = m_conf.blend.enable;
