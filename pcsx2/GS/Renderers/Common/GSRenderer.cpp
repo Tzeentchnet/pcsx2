@@ -45,6 +45,7 @@ static std::mutex s_screenshot_threads_mutex;
 
 static GSPresentationUpscaleHooks s_presentation_upscale_hooks;
 static GSTemporalObservationHooks s_temporal_observation_hooks;
+static GSRenderTimingHooks s_render_timing_hooks;
 static std::atomic<u64> s_last_successful_present_id{0};
 
 std::unique_ptr<GSRenderer> g_gs_renderer;
@@ -58,6 +59,31 @@ void GSSetTemporalObservationHooks(const GSTemporalObservationHooks& hooks)
 {
 	s_temporal_observation_hooks = hooks;
 }
+
+void GSSetRenderTimingHooks(const GSRenderTimingHooks& hooks)
+{
+	s_render_timing_hooks = hooks;
+}
+
+class ScopedRenderTiming
+{
+public:
+	explicit ScopedRenderTiming(GSRenderTimingStage stage)
+		: m_stage(stage)
+	{
+		if (s_render_timing_hooks.marker)
+			s_render_timing_hooks.marker(s_render_timing_hooks.userdata, m_stage, true);
+	}
+
+	~ScopedRenderTiming()
+	{
+		if (s_render_timing_hooks.marker)
+			s_render_timing_hooks.marker(s_render_timing_hooks.userdata, m_stage, false);
+	}
+
+private:
+	GSRenderTimingStage m_stage;
+};
 
 bool GSHasTemporalDrawObserver()
 {
@@ -149,6 +175,7 @@ static PresentationUpscaleAttempt TryPresentationUpscale(
 	attempt.presentation_id = GSGetLastSuccessfulPresentId() + 1;
 	GSPresentationUpscaleFrame frame = {
 		g_gs_device.get(), texture, src_rect, src_uv, draw_rect, attempt.presentation_id, is_redraw, source_may_repeat};
+	ScopedRenderTiming timing(GSRenderTimingStage::PresentationUpscale);
 	attempt.status = GSApplyPresentationUpscaleHook(attempt.hooks, frame);
 	if (attempt.status == GSPresentationUpscaleStatus::Applied)
 	{
@@ -242,6 +269,7 @@ static void ApplyPresentationCAS(
 	if (GSConfig.CASMode == GSCASMode::Disabled)
 		return;
 
+	ScopedRenderTiming timing(GSRenderTimingStage::Sharpen);
 	static bool cas_log_once = false;
 	if (g_gs_device->Features().cas_sharpening)
 	{
@@ -838,7 +866,11 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		}
 	}
 
-	const bool blank_frame = !Merge(field);
+	bool blank_frame;
+	{
+		ScopedRenderTiming timing(GSRenderTimingStage::Merge);
+		blank_frame = !Merge(field);
+	}
 	const u64 temporal_presentation_id = GSGetLastSuccessfulPresentId() + 1;
 
 	m_last_draw_n = s_n;
@@ -918,22 +950,25 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 
 			g_gs_device->PreparePresentSource(current);
 		};
-		if (BeginPresentFrame(false, prepare_present))
 		{
-			if (current && !blank_frame)
+			ScopedRenderTiming timing(GSRenderTimingStage::FinalPresentation);
+			if (BeginPresentFrame(false, prepare_present))
 			{
-				const u64 current_time = Common::Timer::GetCurrentValue();
-				const float shader_time = static_cast<float>(Common::Timer::ConvertValueToSeconds(current_time - m_shader_time_start));
+				if (current && !blank_frame)
+				{
+					const u64 current_time = Common::Timer::GetCurrentValue();
+					const float shader_time = static_cast<float>(Common::Timer::ConvertValueToSeconds(current_time - m_shader_time_start));
 
-				g_gs_device->PresentRect(current, src_uv, nullptr, draw_rect,
-					s_tv_shader_indices[GSConfig.TVShader], shader_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off));
+					g_gs_device->PresentRect(current, src_uv, nullptr, draw_rect,
+						s_tv_shader_indices[GSConfig.TVShader], shader_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off));
+				}
+
+				present_succeeded = EndPresentFrame();
+
+				const float gpu_time = g_gs_device->GetAndResetAccumulatedGPUTime();
+				GPUPipelineStatistics gpu_stats = g_gs_device->GetAndResetAccumulatedGPUPipelineStatistics();
+				PerformanceMetrics::OnGPUPresent(gpu_time, gpu_stats.vs_invocations, gpu_stats.ps_invocations);
 			}
-
-			present_succeeded = EndPresentFrame();
-
-			const float gpu_time = g_gs_device->GetAndResetAccumulatedGPUTime();
-			GPUPipelineStatistics gpu_stats = g_gs_device->GetAndResetAccumulatedGPUPipelineStatistics();
-			PerformanceMetrics::OnGPUPresent(gpu_time, gpu_stats.vs_invocations, gpu_stats.ps_invocations);
 		}
 
 		NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, used_upscaled_output,
@@ -1275,20 +1310,23 @@ void GSRenderer::PresentCurrentFrame()
 		if (current)
 			g_gs_device->PreparePresentSource(current);
 	};
-	if (BeginPresentFrame(false, prepare_present))
 	{
-		if (current)
+		ScopedRenderTiming timing(GSRenderTimingStage::FinalPresentation);
+		if (BeginPresentFrame(false, prepare_present))
 		{
-			s_last_draw_rect = draw_rect;
+			if (current)
+			{
+				s_last_draw_rect = draw_rect;
 
-			const u64 current_time = Common::Timer::GetCurrentValue();
-			const float shader_time = static_cast<float>(Common::Timer::ConvertValueToSeconds(current_time - m_shader_time_start));
+				const u64 current_time = Common::Timer::GetCurrentValue();
+				const float shader_time = static_cast<float>(Common::Timer::ConvertValueToSeconds(current_time - m_shader_time_start));
 
-			g_gs_device->PresentRect(current, src_uv, nullptr, draw_rect,
-				s_tv_shader_indices[GSConfig.TVShader], shader_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off));
+				g_gs_device->PresentRect(current, src_uv, nullptr, draw_rect,
+					s_tv_shader_indices[GSConfig.TVShader], shader_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off));
+			}
+
+			present_succeeded = EndPresentFrame();
 		}
-
-		present_succeeded = EndPresentFrame();
 	}
 	NotifyPresentedUpscaleFrame(upscale_attempt, present_succeeded, used_upscaled_output,
 		current, src_rect, src_uv, draw_rect, true, true);

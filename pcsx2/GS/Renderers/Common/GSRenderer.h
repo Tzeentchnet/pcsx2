@@ -114,9 +114,24 @@ struct GSTemporalObservationHooks
 	void (*presented)(void*, u64 presentation_id, bool succeeded, bool skipped, bool is_redraw) = nullptr;
 };
 
+enum class GSRenderTimingStage : u32
+{
+	Merge,
+	PresentationUpscale,
+	Sharpen,
+	FinalPresentation,
+};
+
+struct GSRenderTimingHooks
+{
+	void* userdata = nullptr;
+	void (*marker)(void*, GSRenderTimingStage stage, bool begin) = nullptr;
+};
+
 // Register/clear on the GS thread, or while it is stopped. Observations do not
 // establish that a target, depth surface, or draw belongs to the displayed world.
 void GSSetTemporalObservationHooks(const GSTemporalObservationHooks& hooks);
+void GSSetRenderTimingHooks(const GSRenderTimingHooks& hooks);
 bool GSHasTemporalDrawObserver();
 void GSObserveTemporalDraw(const GSTemporalDrawObservation& observation);
 void GSObserveTemporalDisplay(int circuit, const GSTemporalTargetObservation& observation);
