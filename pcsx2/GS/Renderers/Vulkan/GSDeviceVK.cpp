@@ -1325,7 +1325,7 @@ void GSDeviceVK::BeginGPUTimingRange(
 	const u32 frame_index = static_cast<u32>(&resources - m_frame_resources.data());
 	const u32 query = frame_index * NUM_GPU_TIMING_QUERIES_PER_FRAME + 2 + range * 2;
 	vkCmdWriteTimestamp(
-		resources.command_buffers[1], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool, query);
+		resources.command_buffers[1], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_timestamp_query_pool, query);
 	resources.gpu_timing_ranges[range] = {stage, instance};
 	resources.active_gpu_timing_instances[static_cast<size_t>(stage)] = instance;
 	pending->second.expected_ranges++;
@@ -1348,7 +1348,7 @@ void GSDeviceVK::EndGPUTimingRange(FrameResources& resources, u64 instance)
 		const u32 frame_index = static_cast<u32>(&resources - m_frame_resources.data());
 		const u32 query = frame_index * NUM_GPU_TIMING_QUERIES_PER_FRAME + 3 + (range - 1) * 2;
 		vkCmdWriteTimestamp(
-			resources.command_buffers[1], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool, query);
+			resources.command_buffers[1], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_timestamp_query_pool, query);
 		active_instance = 0;
 		return;
 	}
