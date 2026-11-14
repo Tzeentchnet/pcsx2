@@ -126,6 +126,7 @@ struct GSRenderTimingHooks
 {
 	void* userdata = nullptr;
 	void (*marker)(void*, GSRenderTimingStage stage, bool begin) = nullptr;
+	void (*gpu_time)(void*, GSGPUTimingStage stage, float milliseconds) = nullptr;
 };
 
 // Register/clear on the GS thread, or while it is stopped. Observations do not

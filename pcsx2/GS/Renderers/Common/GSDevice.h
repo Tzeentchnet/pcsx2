@@ -15,6 +15,7 @@
 #include <array>
 #include <functional>
 #include <span>
+#include <vector>
 
 enum class Filter
 {
@@ -34,6 +35,22 @@ struct GPUPipelineStatistics
 {
 	u64 vs_invocations;
 	u64 ps_invocations;
+};
+
+enum class GSGPUTimingStage : u32
+{
+	UploadDraw,
+	Merge,
+	PresentationUpscale,
+	Sharpen,
+	FinalPresentation,
+	Count,
+};
+
+struct GSGPUTimingSample
+{
+	GSGPUTimingStage stage;
+	float milliseconds;
 };
 
 enum class ShaderConvert
@@ -1651,6 +1668,11 @@ public:
 
 	/// Returns the amount of GPU time utilized since the last time this method was called.
 	virtual float GetAndResetAccumulatedGPUTime() = 0;
+
+	/// Optional stage timing. Unsupported backends leave these as no-ops and return no samples.
+	virtual void BeginGPUTimingStage(GSGPUTimingStage stage) {}
+	virtual void EndGPUTimingStage(GSGPUTimingStage stage) {}
+	virtual std::vector<GSGPUTimingSample> GetAndResetAccumulatedGPUStageTimes() { return {}; }
 
 	/// Enables/disables GPU pipeline statistics.
 	virtual bool SetGPUPipelineStatisticsEnabled(bool enabled) = 0;

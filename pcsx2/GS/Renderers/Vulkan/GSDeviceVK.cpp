@@ -1136,8 +1136,10 @@ bool GSDeviceVK::CreateGlobalDescriptorPool()
 
 	if (m_gpu_timing_supported)
 	{
+		constexpr u32 query_count =
+			NUM_COMMAND_BUFFERS * (NUM_GPU_TIMING_QUERIES_PER_FRAME + NUM_GPU_TIMING_QUERIES_PER_SPIN);
 		const VkQueryPoolCreateInfo query_create_info = {
-			VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_TIMESTAMP, NUM_COMMAND_BUFFERS * 4, 0};
+			VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_TIMESTAMP, query_count, 0};
 		res = vkCreateQueryPool(m_device, &query_create_info, nullptr, &m_timestamp_query_pool);
 		if (res != VK_SUCCESS)
 		{
@@ -1283,7 +1285,120 @@ float GSDeviceVK::GetAndResetAccumulatedGPUTime()
 bool GSDeviceVK::SetGPUTimingEnabled(bool enabled)
 {
 	m_gpu_timing_enabled = enabled && m_gpu_timing_supported;
+	if (!m_gpu_timing_enabled)
+	{
+		m_active_gpu_timing_stages.clear();
+		m_pending_gpu_timing_stages.clear();
+		m_completed_gpu_timing_stages.clear();
+		for (FrameResources& resources : m_frame_resources)
+		{
+			resources.gpu_timing_range_count = 0;
+			resources.active_gpu_timing_instances.fill(0);
+		}
+	}
 	return (enabled == m_gpu_timing_enabled);
+}
+
+std::vector<GSGPUTimingSample> GSDeviceVK::GetAndResetAccumulatedGPUStageTimes()
+{
+	std::vector<GSGPUTimingSample> samples = std::move(m_completed_gpu_timing_stages);
+	m_completed_gpu_timing_stages.clear();
+	return samples;
+}
+
+void GSDeviceVK::BeginGPUTimingRange(
+	FrameResources& resources, GSGPUTimingStage stage, u64 instance)
+{
+	if (resources.timestamp_query_state != QueryState::Querying)
+		return;
+
+	auto pending = m_pending_gpu_timing_stages.find(instance);
+	if (pending == m_pending_gpu_timing_stages.end())
+		return;
+	if (resources.gpu_timing_range_count >= MAX_GPU_TIMING_RANGES)
+	{
+		pending->second.dropped = true;
+		return;
+	}
+
+	const u32 range = resources.gpu_timing_range_count++;
+	const u32 frame_index = static_cast<u32>(&resources - m_frame_resources.data());
+	const u32 query = frame_index * NUM_GPU_TIMING_QUERIES_PER_FRAME + 2 + range * 2;
+	vkCmdWriteTimestamp(
+		resources.command_buffers[1], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool, query);
+	resources.gpu_timing_ranges[range] = {stage, instance};
+	resources.active_gpu_timing_instances[static_cast<size_t>(stage)] = instance;
+	pending->second.expected_ranges++;
+}
+
+void GSDeviceVK::EndGPUTimingRange(FrameResources& resources, u64 instance)
+{
+	const auto pending = m_pending_gpu_timing_stages.find(instance);
+	if (pending == m_pending_gpu_timing_stages.end())
+		return;
+	const GSGPUTimingStage stage = pending->second.stage;
+	u64& active_instance = resources.active_gpu_timing_instances[static_cast<size_t>(stage)];
+	if (active_instance != instance)
+		return;
+
+	for (u32 range = resources.gpu_timing_range_count; range > 0; range--)
+	{
+		if (resources.gpu_timing_ranges[range - 1].instance != instance)
+			continue;
+		const u32 frame_index = static_cast<u32>(&resources - m_frame_resources.data());
+		const u32 query = frame_index * NUM_GPU_TIMING_QUERIES_PER_FRAME + 3 + (range - 1) * 2;
+		vkCmdWriteTimestamp(
+			resources.command_buffers[1], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool, query);
+		active_instance = 0;
+		return;
+	}
+}
+
+void GSDeviceVK::CompleteGPUTimingStage(u64 instance)
+{
+	const auto pending = m_pending_gpu_timing_stages.find(instance);
+	if (pending == m_pending_gpu_timing_stages.end() || !pending->second.closed ||
+		pending->second.completed_ranges != pending->second.expected_ranges)
+	{
+		return;
+	}
+	if (!pending->second.dropped && pending->second.expected_ranges > 0)
+		m_completed_gpu_timing_stages.push_back({pending->second.stage, pending->second.milliseconds});
+	m_pending_gpu_timing_stages.erase(pending);
+}
+
+void GSDeviceVK::BeginGPUTimingStage(GSGPUTimingStage stage)
+{
+	FrameResources& resources = m_frame_resources[m_current_frame];
+	if (!m_gpu_timing_enabled || resources.timestamp_query_state != QueryState::Querying)
+		return;
+	if (std::any_of(m_active_gpu_timing_stages.begin(), m_active_gpu_timing_stages.end(),
+			[stage](const auto& active) { return active.first == stage; }))
+	{
+		return;
+	}
+
+	const u64 instance = m_next_gpu_timing_instance++;
+	m_pending_gpu_timing_stages.emplace(instance, PendingGPUTimingStage{stage});
+	m_active_gpu_timing_stages.emplace_back(stage, instance);
+	BeginGPUTimingRange(resources, stage, instance);
+}
+
+void GSDeviceVK::EndGPUTimingStage(GSGPUTimingStage stage)
+{
+	if (!m_gpu_timing_enabled || m_active_gpu_timing_stages.empty() ||
+		m_active_gpu_timing_stages.back().first != stage)
+	{
+		return;
+	}
+
+	const u64 instance = m_active_gpu_timing_stages.back().second;
+	EndGPUTimingRange(m_frame_resources[m_current_frame], instance);
+	m_active_gpu_timing_stages.pop_back();
+	auto pending = m_pending_gpu_timing_stages.find(instance);
+	if (pending != m_pending_gpu_timing_stages.end())
+		pending->second.closed = true;
+	CompleteGPUTimingStage(instance);
 }
 
 GPUPipelineStatistics GSDeviceVK::GetAndResetAccumulatedGPUPipelineStatistics()
@@ -1304,10 +1419,16 @@ void GSDeviceVK::StartGPUTiming(u32 index)
 	if (m_gpu_timing_enabled || m_spin_timer)
 	{
 		FrameResources& resources = m_frame_resources[index];
-		vkCmdResetQueryPool(resources.command_buffers[1], m_timestamp_query_pool, index * 2, 2);
+		const u32 query_base = index * NUM_GPU_TIMING_QUERIES_PER_FRAME;
+		vkCmdResetQueryPool(resources.command_buffers[1], m_timestamp_query_pool,
+			query_base, NUM_GPU_TIMING_QUERIES_PER_FRAME);
 		vkCmdWriteTimestamp(
-			resources.command_buffers[1], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool, index * 2);
+			resources.command_buffers[1], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool, query_base);
 		resources.timestamp_query_state = QueryState::Querying;
+		resources.gpu_timing_range_count = 0;
+		resources.active_gpu_timing_instances.fill(0);
+		for (const auto& active : m_active_gpu_timing_stages)
+			BeginGPUTimingRange(resources, active.first, active.second);
 	}
 }
 
@@ -1319,8 +1440,10 @@ void GSDeviceVK::EndGPUTiming(u32 index)
 
 	if (wants_timestamp && resources.timestamp_query_state == QueryState::Querying)
 	{
+		for (auto active = m_active_gpu_timing_stages.rbegin(); active != m_active_gpu_timing_stages.rend(); active++)
+			EndGPUTimingRange(resources, active->second);
 		vkCmdWriteTimestamp(m_current_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool,
-			m_current_frame * 2 + 1);
+			m_current_frame * NUM_GPU_TIMING_QUERIES_PER_FRAME + 1);
 		resources.timestamp_query_state = QueryState::Ready;
 	}
 }
@@ -1333,10 +1456,11 @@ void GSDeviceVK::ReadGPUTiming(u32 index)
 
 	if (wants_timestamps && resources.timestamp_query_state == QueryState::Ready)
 	{
-		std::array<u64, 2> timestamps;
-		const VkResult res =
-			vkGetQueryPoolResults(m_device, m_timestamp_query_pool, index * 2, static_cast<u32>(timestamps.size()),
-				sizeof(u64) * timestamps.size(), timestamps.data(), sizeof(u64), VK_QUERY_RESULT_64_BIT);
+		std::array<u64, NUM_GPU_TIMING_QUERIES_PER_FRAME> timestamps{};
+		const u32 query_count = 2 + resources.gpu_timing_range_count * 2;
+		const VkResult res = vkGetQueryPoolResults(m_device, m_timestamp_query_pool,
+			index * NUM_GPU_TIMING_QUERIES_PER_FRAME, query_count, sizeof(u64) * query_count,
+			timestamps.data(), sizeof(u64), VK_QUERY_RESULT_64_BIT);
 		if (res == VK_SUCCESS)
 		{
 			// if we didn't write the timestamp at the start of the cmdbuffer (just enabled timing), the first TS will be zero
@@ -1345,6 +1469,27 @@ void GSDeviceVK::ReadGPUTiming(u32 index)
 				const double ns_diff =
 					(timestamps[1] - timestamps[0]) * static_cast<double>(m_device_properties.limits.timestampPeriod);
 				m_accumulated_gpu_time += ns_diff / 1000000.0;
+			}
+			for (u32 range = 0; range < resources.gpu_timing_range_count; range++)
+			{
+				const GPUTimingRange& timing_range = resources.gpu_timing_ranges[range];
+				auto pending = m_pending_gpu_timing_stages.find(timing_range.instance);
+				if (pending == m_pending_gpu_timing_stages.end())
+					continue;
+				const u64 begin = timestamps[2 + range * 2];
+				const u64 end = timestamps[3 + range * 2];
+				if (begin > 0 && end >= begin)
+				{
+					const double ns_diff =
+						(end - begin) * static_cast<double>(m_device_properties.limits.timestampPeriod);
+					pending->second.milliseconds += static_cast<float>(ns_diff / 1000000.0);
+				}
+				else
+				{
+					pending->second.dropped = true;
+				}
+				pending->second.completed_ranges++;
+				CompleteGPUTimingStage(timing_range.instance);
 			}
 			if (resources.spin_id >= 0)
 			{
@@ -1364,6 +1509,16 @@ void GSDeviceVK::ReadGPUTiming(u32 index)
 		else
 		{
 			LOG_VULKAN_ERROR(res, "vkGetQueryPoolResults failed: ");
+			for (u32 range = 0; range < resources.gpu_timing_range_count; range++)
+			{
+				const u64 instance = resources.gpu_timing_ranges[range].instance;
+				auto pending = m_pending_gpu_timing_stages.find(instance);
+				if (pending == m_pending_gpu_timing_stages.end())
+					continue;
+				pending->second.dropped = true;
+				pending->second.completed_ranges++;
+				CompleteGPUTimingStage(instance);
+			}
 		}
 
 		resources.timestamp_query_state = QueryState::None;
@@ -2097,7 +2252,8 @@ void GSDeviceVK::SpinCommandCompleted(u32 index)
 {
 	SpinResources& resources = m_spin_resources[index];
 	resources.in_progress = false;
-	const u32 timestamp_base = (index + NUM_COMMAND_BUFFERS) * 2;
+	const u32 timestamp_base =
+		NUM_COMMAND_BUFFERS * NUM_GPU_TIMING_QUERIES_PER_FRAME + index * NUM_GPU_TIMING_QUERIES_PER_SPIN;
 	std::array<u64, 2> timestamps;
 	const VkResult res =
 		vkGetQueryPoolResults(m_device, m_timestamp_query_pool, timestamp_base, static_cast<u32>(timestamps.size()),
@@ -2162,7 +2318,8 @@ void GSDeviceVK::SubmitSpinCommand(u32 index, u32 cycles)
 		vkCmdPipelineBarrier(resources.command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
 			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 0, nullptr);
 
-	const u32 timestamp_base = (index + NUM_COMMAND_BUFFERS) * 2;
+	const u32 timestamp_base =
+		NUM_COMMAND_BUFFERS * NUM_GPU_TIMING_QUERIES_PER_FRAME + index * NUM_GPU_TIMING_QUERIES_PER_SPIN;
 	vkCmdResetQueryPool(resources.command_buffer, m_timestamp_query_pool, timestamp_base, 2);
 	vkCmdWriteTimestamp(
 		resources.command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool, timestamp_base);

@@ -65,12 +65,15 @@ void GSSetRenderTimingHooks(const GSRenderTimingHooks& hooks)
 	s_render_timing_hooks = hooks;
 }
 
+static GSGPUTimingStage ToGPUTimingStage(GSRenderTimingStage stage);
+
 class ScopedRenderTiming
 {
 public:
 	explicit ScopedRenderTiming(GSRenderTimingStage stage)
 		: m_stage(stage)
 	{
+		g_gs_device->BeginGPUTimingStage(ToGPUTimingStage(m_stage));
 		if (s_render_timing_hooks.marker)
 			s_render_timing_hooks.marker(s_render_timing_hooks.userdata, m_stage, true);
 	}
@@ -79,6 +82,7 @@ public:
 	{
 		if (s_render_timing_hooks.marker)
 			s_render_timing_hooks.marker(s_render_timing_hooks.userdata, m_stage, false);
+		g_gs_device->EndGPUTimingStage(ToGPUTimingStage(m_stage));
 	}
 
 private:
@@ -118,6 +122,28 @@ static void ObserveTemporalPresented(u64 presentation_id, bool succeeded, bool s
 	if (s_temporal_observation_hooks.presented)
 		s_temporal_observation_hooks.presented(
 			s_temporal_observation_hooks.userdata, presentation_id, succeeded, skipped, redraw);
+}
+
+static GSGPUTimingStage ToGPUTimingStage(GSRenderTimingStage stage)
+{
+	switch (stage)
+	{
+		case GSRenderTimingStage::Merge: return GSGPUTimingStage::Merge;
+		case GSRenderTimingStage::PresentationUpscale: return GSGPUTimingStage::PresentationUpscale;
+		case GSRenderTimingStage::Sharpen: return GSGPUTimingStage::Sharpen;
+		case GSRenderTimingStage::FinalPresentation: return GSGPUTimingStage::FinalPresentation;
+	}
+	pxFailRel("Unknown render timing stage");
+	return GSGPUTimingStage::FinalPresentation;
+}
+
+static void ReportGPUTimingStages()
+{
+	const std::vector<GSGPUTimingSample> samples = g_gs_device->GetAndResetAccumulatedGPUStageTimes();
+	if (!s_render_timing_hooks.gpu_time)
+		return;
+	for (const GSGPUTimingSample& sample : samples)
+		s_render_timing_hooks.gpu_time(s_render_timing_hooks.userdata, sample.stage, sample.milliseconds);
 }
 
 u64 GSGetLastSuccessfulPresentId()
@@ -966,6 +992,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				present_succeeded = EndPresentFrame();
 
 				const float gpu_time = g_gs_device->GetAndResetAccumulatedGPUTime();
+				ReportGPUTimingStages();
 				GPUPipelineStatistics gpu_stats = g_gs_device->GetAndResetAccumulatedGPUPipelineStatistics();
 				PerformanceMetrics::OnGPUPresent(gpu_time, gpu_stats.vs_invocations, gpu_stats.ps_invocations);
 			}

@@ -31,6 +31,9 @@ public:
 	enum : u32
 	{
 		NUM_COMMAND_BUFFERS = 3,
+		MAX_GPU_TIMING_RANGES = 16,
+		NUM_GPU_TIMING_QUERIES_PER_FRAME = 2 + MAX_GPU_TIMING_RANGES * 2,
+		NUM_GPU_TIMING_QUERIES_PER_SPIN = 2,
 	};
 
 	struct OptionalExtensions
@@ -285,6 +288,22 @@ private:
 		Ready,
 	};
 
+	struct GPUTimingRange
+	{
+		GSGPUTimingStage stage = GSGPUTimingStage::UploadDraw;
+		u64 instance = 0;
+	};
+
+	struct PendingGPUTimingStage
+	{
+		GSGPUTimingStage stage = GSGPUTimingStage::UploadDraw;
+		float milliseconds = 0.0f;
+		u32 expected_ranges = 0;
+		u32 completed_ranges = 0;
+		bool closed = false;
+		bool dropped = false;
+	};
+
 	struct FrameResources
 	{
 		// [0] - Init (upload) command buffer, [1] - draw command buffer
@@ -298,9 +317,16 @@ private:
 		bool needs_fence_wait = false;
 		QueryState timestamp_query_state = QueryState::None;
 		QueryState pipeline_statistics_query = QueryState::None;
+		std::array<GPUTimingRange, MAX_GPU_TIMING_RANGES> gpu_timing_ranges{};
+		std::array<u64, static_cast<size_t>(GSGPUTimingStage::Count)> active_gpu_timing_instances{};
+		u32 gpu_timing_range_count = 0;
 
 		std::vector<std::function<void()>> cleanup_resources;
 	};
+
+	void BeginGPUTimingRange(FrameResources& resources, GSGPUTimingStage stage, u64 instance);
+	void EndGPUTimingRange(FrameResources& resources, u64 instance);
+	void CompleteGPUTimingStage(u64 instance);
 
 	struct SpinResources
 	{
@@ -358,6 +384,10 @@ private:
 	bool m_gpu_timing_supported = false;
 	bool m_wants_new_timestamp_calibration = false;
 	VkTimeDomainEXT m_calibrated_timestamp_type = VK_TIME_DOMAIN_DEVICE_EXT;
+	u64 m_next_gpu_timing_instance = 1;
+	std::vector<std::pair<GSGPUTimingStage, u64>> m_active_gpu_timing_stages;
+	std::map<u64, PendingGPUTimingStage> m_pending_gpu_timing_stages;
+	std::vector<GSGPUTimingSample> m_completed_gpu_timing_stages;
 
 	VkQueryPool m_pipeline_statistics_query_pool = VK_NULL_HANDLE;
 	GPUPipelineStatistics m_accumulated_gpu_pipeline_statistics{};
@@ -654,6 +684,9 @@ public:
 	void EndGPUTiming(u32 index);
 	void ReadGPUTiming(u32 index);
 	float GetAndResetAccumulatedGPUTime() override;
+	void BeginGPUTimingStage(GSGPUTimingStage stage) override;
+	void EndGPUTimingStage(GSGPUTimingStage stage) override;
+	std::vector<GSGPUTimingSample> GetAndResetAccumulatedGPUStageTimes() override;
 
 	bool SetGPUPipelineStatisticsEnabled(bool enabled) override;
 	GPUPipelineStatistics GetAndResetAccumulatedGPUPipelineStatistics() override;
