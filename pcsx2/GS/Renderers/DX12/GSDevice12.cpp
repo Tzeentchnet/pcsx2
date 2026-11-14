@@ -832,7 +832,119 @@ float GSDevice12::GetAndResetAccumulatedGPUTime()
 bool GSDevice12::SetGPUTimingEnabled(bool enabled)
 {
 	m_gpu_timing_enabled = enabled;
+	if (!enabled)
+	{
+		m_active_gpu_timing_stages.clear();
+		m_pending_gpu_timing_stages.clear();
+		m_completed_gpu_timing_stages.clear();
+		for (CommandListResources& resources : m_command_lists)
+		{
+			resources.gpu_timing_range_count = 0;
+			resources.active_gpu_timing_instances.fill(0);
+		}
+	}
 	return true;
+}
+
+std::vector<GSGPUTimingSample> GSDevice12::GetAndResetAccumulatedGPUStageTimes()
+{
+	std::vector<GSGPUTimingSample> samples = std::move(m_completed_gpu_timing_stages);
+	m_completed_gpu_timing_stages.clear();
+	return samples;
+}
+
+void GSDevice12::BeginGPUTimingRange(
+	CommandListResources& resources, GSGPUTimingStage stage, u64 instance)
+{
+	if (resources.timestamp_query_state != QueryState::Querying)
+		return;
+
+	auto pending = m_pending_gpu_timing_stages.find(instance);
+	if (pending == m_pending_gpu_timing_stages.end())
+		return;
+	if (resources.gpu_timing_range_count >= MAX_GPU_TIMING_RANGES)
+	{
+		pending->second.dropped = true;
+		return;
+	}
+
+	const u32 range = resources.gpu_timing_range_count++;
+	const u32 query = m_current_command_list * NUM_TIMESTAMP_QUERIES_PER_CMDLIST + 2 + range * 2;
+	resources.command_lists[1].list4->EndQuery(
+		m_timestamp_query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, query);
+	resources.gpu_timing_ranges[range] = {stage, instance};
+	resources.active_gpu_timing_instances[static_cast<size_t>(stage)] = instance;
+	pending->second.expected_ranges++;
+}
+
+void GSDevice12::EndGPUTimingRange(CommandListResources& resources, u64 instance)
+{
+	const auto pending = m_pending_gpu_timing_stages.find(instance);
+	if (pending == m_pending_gpu_timing_stages.end())
+		return;
+	const GSGPUTimingStage stage = pending->second.stage;
+	u64& active_instance = resources.active_gpu_timing_instances[static_cast<size_t>(stage)];
+	if (active_instance != instance)
+		return;
+
+	for (u32 range = resources.gpu_timing_range_count; range > 0; range--)
+	{
+		if (resources.gpu_timing_ranges[range - 1].instance != instance)
+			continue;
+		const u32 query =
+			m_current_command_list * NUM_TIMESTAMP_QUERIES_PER_CMDLIST + 3 + (range - 1) * 2;
+		resources.command_lists[1].list4->EndQuery(
+			m_timestamp_query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, query);
+		active_instance = 0;
+		return;
+	}
+}
+
+void GSDevice12::CompleteGPUTimingStage(u64 instance)
+{
+	const auto pending = m_pending_gpu_timing_stages.find(instance);
+	if (pending == m_pending_gpu_timing_stages.end() || !pending->second.closed ||
+		pending->second.completed_ranges != pending->second.expected_ranges)
+	{
+		return;
+	}
+	if (!pending->second.dropped && pending->second.expected_ranges > 0)
+		m_completed_gpu_timing_stages.push_back({pending->second.stage, pending->second.milliseconds});
+	m_pending_gpu_timing_stages.erase(pending);
+}
+
+void GSDevice12::BeginGPUTimingStage(GSGPUTimingStage stage)
+{
+	CommandListResources& resources = m_command_lists[m_current_command_list];
+	if (!m_gpu_timing_enabled || resources.timestamp_query_state != QueryState::Querying)
+		return;
+	if (std::any_of(m_active_gpu_timing_stages.begin(), m_active_gpu_timing_stages.end(),
+			[stage](const auto& active) { return active.first == stage; }))
+	{
+		return;
+	}
+
+	const u64 instance = m_next_gpu_timing_instance++;
+	m_pending_gpu_timing_stages.emplace(instance, PendingGPUTimingStage{stage});
+	m_active_gpu_timing_stages.emplace_back(stage, instance);
+	BeginGPUTimingRange(resources, stage, instance);
+}
+
+void GSDevice12::EndGPUTimingStage(GSGPUTimingStage stage)
+{
+	if (!m_gpu_timing_enabled || m_active_gpu_timing_stages.empty() ||
+		m_active_gpu_timing_stages.back().first != stage)
+	{
+		return;
+	}
+
+	const u64 instance = m_active_gpu_timing_stages.back().second;
+	EndGPUTimingRange(m_command_lists[m_current_command_list], instance);
+	m_active_gpu_timing_stages.pop_back();
+	auto pending = m_pending_gpu_timing_stages.find(instance);
+	if (pending != m_pending_gpu_timing_stages.end())
+		pending->second.closed = true;
+	CompleteGPUTimingStage(instance);
 }
 
 GPUPipelineStatistics GSDevice12::GetAndResetAccumulatedGPUPipelineStatistics()
@@ -856,6 +968,10 @@ void GSDevice12::StartGPUTiming()
 		res.command_lists[1].list4->EndQuery(m_timestamp_query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP,
 			m_current_command_list * NUM_TIMESTAMP_QUERIES_PER_CMDLIST);
 		res.timestamp_query_state = QueryState::Querying;
+		res.gpu_timing_range_count = 0;
+		res.active_gpu_timing_instances.fill(0);
+		for (const auto& active : m_active_gpu_timing_stages)
+			BeginGPUTimingRange(res, active.first, active.second);
 	}
 }
 
@@ -864,13 +980,16 @@ void GSDevice12::EndGPUTiming()
 	CommandListResources& res = m_command_lists[m_current_command_list];
 	if (res.timestamp_query_state == QueryState::Querying)
 	{
-		// write the timestamp back at the end of the cmdlist
-		if (InRenderPass())
-			EndRenderPass(); // Can't end query in a render pass
+		for (auto active = m_active_gpu_timing_stages.rbegin(); active != m_active_gpu_timing_stages.rend(); active++)
+			EndGPUTimingRange(res, active->second);
 		res.command_lists[1].list4->EndQuery(m_timestamp_query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP,
 			(m_current_command_list * NUM_TIMESTAMP_QUERIES_PER_CMDLIST) + 1);
+		// Timestamp EndQuery is legal inside a D3D12 render pass; ResolveQueryData is not.
+		if (InRenderPass())
+			EndRenderPass();
+		const u32 query_count = 2 + res.gpu_timing_range_count * 2;
 		res.command_lists[1].list4->ResolveQueryData(m_timestamp_query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP,
-			m_current_command_list * NUM_TIMESTAMP_QUERIES_PER_CMDLIST, NUM_TIMESTAMP_QUERIES_PER_CMDLIST,
+			m_current_command_list * NUM_TIMESTAMP_QUERIES_PER_CMDLIST, query_count,
 			m_timestamp_query_buffer.get(), m_current_command_list * (sizeof(u64) * NUM_TIMESTAMP_QUERIES_PER_CMDLIST));
 		res.timestamp_query_state = QueryState::Ready;
 	}
@@ -884,15 +1003,39 @@ void GSDevice12::ReadGPUTiming()
 		// readback timestamp from the last time this cmdlist was used.
 		// we don't need to worry about disjoint in dx12, the frequency is reliable within a single cmdlist.
 		const u32 offset = (m_current_command_list * (sizeof(u64) * NUM_TIMESTAMP_QUERIES_PER_CMDLIST));
-		const D3D12_RANGE read_range = { offset, offset + (sizeof(u64) * NUM_TIMESTAMP_QUERIES_PER_CMDLIST) };
+		const u32 query_count = 2 + res.gpu_timing_range_count * 2;
+		const D3D12_RANGE read_range = {offset, offset + (sizeof(u64) * query_count)};
 		void* map;
 		HRESULT hr = m_timestamp_query_buffer->Map(0, &read_range, &map);
 		if (SUCCEEDED(hr))
 		{
-			u64 timestamps[2];
-			std::memcpy(timestamps, static_cast<const u8*>(map) + offset, sizeof(timestamps));
-			m_accumulated_gpu_time +=
-				static_cast<float>(static_cast<double>(timestamps[1] - timestamps[0]) / m_timestamp_frequency);
+			std::array<u64, NUM_TIMESTAMP_QUERIES_PER_CMDLIST> timestamps{};
+			std::memcpy(timestamps.data(), static_cast<const u8*>(map) + offset, sizeof(u64) * query_count);
+			if (timestamps[0] > 0 && timestamps[1] >= timestamps[0])
+			{
+				m_accumulated_gpu_time +=
+					static_cast<float>(static_cast<double>(timestamps[1] - timestamps[0]) / m_timestamp_frequency);
+			}
+			for (u32 range = 0; range < res.gpu_timing_range_count; range++)
+			{
+				const GPUTimingRange& timing_range = res.gpu_timing_ranges[range];
+				auto pending = m_pending_gpu_timing_stages.find(timing_range.instance);
+				if (pending == m_pending_gpu_timing_stages.end())
+					continue;
+				const u64 begin = timestamps[2 + range * 2];
+				const u64 end = timestamps[3 + range * 2];
+				if (begin > 0 && end >= begin)
+				{
+					pending->second.milliseconds +=
+						static_cast<float>(static_cast<double>(end - begin) / m_timestamp_frequency);
+				}
+				else
+				{
+					pending->second.dropped = true;
+				}
+				pending->second.completed_ranges++;
+				CompleteGPUTimingStage(timing_range.instance);
+			}
 
 			const D3D12_RANGE write_range = {};
 			m_timestamp_query_buffer->Unmap(0, &write_range);
@@ -900,6 +1043,16 @@ void GSDevice12::ReadGPUTiming()
 		else
 		{
 			Console.Warning("D3D12: Map() for timestamp query failed: %08X", hr);
+			for (u32 range = 0; range < res.gpu_timing_range_count; range++)
+			{
+				const u64 instance = res.gpu_timing_ranges[range].instance;
+				auto pending = m_pending_gpu_timing_stages.find(instance);
+				if (pending == m_pending_gpu_timing_stages.end())
+					continue;
+				pending->second.dropped = true;
+				pending->second.completed_ranges++;
+				CompleteGPUTimingStage(instance);
+			}
 		}
 
 		res.timestamp_query_state = QueryState::None;

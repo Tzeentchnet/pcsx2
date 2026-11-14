@@ -13,7 +13,9 @@
 
 #include <array>
 #include <dxgi1_5.h>
+#include <map>
 #include <unordered_map>
+#include <vector>
 
 namespace D3D12MA
 {
@@ -46,8 +48,10 @@ public:
 		/// Maximum number of samples in a single allocation group.
 		SAMPLER_GROUP_SIZE = 2,
 
-		/// Start/End timestamp queries.
-		NUM_TIMESTAMP_QUERIES_PER_CMDLIST = 2,
+		MAX_GPU_TIMING_RANGES = 16,
+
+		/// Whole-command-list start/end plus stage-range timestamp queries.
+		NUM_TIMESTAMP_QUERIES_PER_CMDLIST = 2 + MAX_GPU_TIMING_RANGES * 2,
 	};
 
 	union D3D12_RESOURCE_DESCU
@@ -200,6 +204,22 @@ private:
 		Ready,
 	};
 
+	struct GPUTimingRange
+	{
+		GSGPUTimingStage stage = GSGPUTimingStage::UploadDraw;
+		u64 instance = 0;
+	};
+
+	struct PendingGPUTimingStage
+	{
+		GSGPUTimingStage stage = GSGPUTimingStage::UploadDraw;
+		float milliseconds = 0.0f;
+		u32 expected_ranges = 0;
+		u32 completed_ranges = 0;
+		bool closed = false;
+		bool dropped = false;
+	};
+
 	struct CommandListResources
 	{
 		std::array<ComPtr<ID3D12CommandAllocator>, 2> command_allocators;
@@ -212,6 +232,9 @@ private:
 		bool init_command_list_used = false;
 		QueryState timestamp_query_state = QueryState::None;
 		QueryState pipeline_statistics_query = QueryState::None;
+		std::array<GPUTimingRange, MAX_GPU_TIMING_RANGES> gpu_timing_ranges{};
+		std::array<u64, static_cast<size_t>(GSGPUTimingStage::Count)> active_gpu_timing_instances{};
+		u32 gpu_timing_range_count = 0;
 	};
 
 	void LoadAgilitySDK();
@@ -223,6 +246,9 @@ private:
 	bool CreatePipelineStatisticsQuery();
 	void MoveToNextCommandList();
 	void DestroyPendingResources(CommandListResources& cmdlist);
+	void BeginGPUTimingRange(CommandListResources& resources, GSGPUTimingStage stage, u64 instance);
+	void EndGPUTimingRange(CommandListResources& resources, u64 instance);
+	void CompleteGPUTimingStage(u64 instance);
 
 	ComPtr<IDXGIAdapter1> m_adapter;
 	ComPtr<ID3D12Device> m_device;
@@ -243,6 +269,10 @@ private:
 	double m_timestamp_frequency = 0.0;
 	float m_accumulated_gpu_time = 0.0f;
 	bool m_gpu_timing_enabled = false;
+	u64 m_next_gpu_timing_instance = 1;
+	std::vector<std::pair<GSGPUTimingStage, u64>> m_active_gpu_timing_stages;
+	std::map<u64, PendingGPUTimingStage> m_pending_gpu_timing_stages;
+	std::vector<GSGPUTimingSample> m_completed_gpu_timing_stages;
 	bool m_programmable_sample_positions = false;
 
 	ComPtr<ID3D12QueryHeap> m_pipeline_statistics_query_heap;
@@ -536,6 +566,9 @@ public:
 	void EndGPUTiming();
 	void ReadGPUTiming();
 	float GetAndResetAccumulatedGPUTime() override;
+	void BeginGPUTimingStage(GSGPUTimingStage stage) override;
+	void EndGPUTimingStage(GSGPUTimingStage stage) override;
+	std::vector<GSGPUTimingSample> GetAndResetAccumulatedGPUStageTimes() override;
 
 	bool SetGPUPipelineStatisticsEnabled(bool enabled) override;
 	GPUPipelineStatistics GetAndResetAccumulatedGPUPipelineStatistics() override;
