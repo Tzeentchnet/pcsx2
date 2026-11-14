@@ -72,8 +72,10 @@ class ScopedRenderTiming
 public:
 	explicit ScopedRenderTiming(GSRenderTimingStage stage)
 		: m_stage(stage)
+		, m_gpu_timing(s_render_timing_hooks.gpu_time != nullptr)
 	{
-		g_gs_device->BeginGPUTimingStage(ToGPUTimingStage(m_stage));
+		if (m_gpu_timing)
+			g_gs_device->BeginGPUTimingStage(ToGPUTimingStage(m_stage));
 		if (s_render_timing_hooks.marker)
 			s_render_timing_hooks.marker(s_render_timing_hooks.userdata, m_stage, true);
 	}
@@ -82,11 +84,13 @@ public:
 	{
 		if (s_render_timing_hooks.marker)
 			s_render_timing_hooks.marker(s_render_timing_hooks.userdata, m_stage, false);
-		g_gs_device->EndGPUTimingStage(ToGPUTimingStage(m_stage));
+		if (m_gpu_timing)
+			g_gs_device->EndGPUTimingStage(ToGPUTimingStage(m_stage));
 	}
 
 private:
 	GSRenderTimingStage m_stage;
+	bool m_gpu_timing;
 };
 
 bool GSHasTemporalDrawObserver()
